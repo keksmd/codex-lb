@@ -172,7 +172,7 @@ class StubAccountsRepository:
 
 
 @pytest.mark.asyncio
-async def test_usage_updater_deactivates_on_account_invalid_4xx(monkeypatch) -> None:
+async def test_usage_updater_does_not_deactivate_on_account_invalid_4xx(monkeypatch) -> None:
     monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
     from app.core.clients.usage import UsageFetchError
     from app.core.config.settings import get_settings
@@ -192,12 +192,7 @@ async def test_usage_updater_deactivates_on_account_invalid_4xx(monkeypatch) -> 
 
     await updater.refresh_accounts([acc], latest_usage={})
 
-    assert len(accounts_repo.status_updates) == 1
-    update = accounts_repo.status_updates[0]
-    assert update["account_id"] == "acc_402"
-    assert update["status"] == AccountStatus.DEACTIVATED
-    assert "402" in update["deactivation_reason"]
-    assert "Payment Required" in update["deactivation_reason"]
+    assert len(accounts_repo.status_updates) == 0
 
 
 @pytest.mark.asyncio

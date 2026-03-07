@@ -16,3 +16,13 @@
 ## Review (Refresh Token Endpoint Hardening)
 - [x] Confirm refresh exchange posts to the resolved endpoint and not a derived base URL path.
 - [x] Confirm request payload uses client id `app_EMoamEEZ73f0CkXaXp7hrann` and scope `openid profile email`.
+
+## CI Bugfix: SPA Static Dir And Usage Deactivation
+- [x] Reproduce the SPA fallback and usage updater CI failures locally.
+- [x] Ensure the SPA static directory exists in clean checkouts before serving or test setup writes.
+- [x] Update the outdated usage updater test to match the intended no-auto-deactivation behavior.
+- [x] Verify the targeted tests pass locally.
+
+## Review (CI Bugfix: SPA Static Dir And Usage Deactivation)
+- [x] Confirm SPA fallback still returns `503` with the frontend build hint when `index.html` is missing.
+- [x] Confirm usage updater does not auto-deactivate on `402`, `401`, `429`, or `5xx`.
