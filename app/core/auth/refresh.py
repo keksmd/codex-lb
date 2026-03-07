@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -17,6 +18,8 @@ from app.core.utils.request_id import get_request_id
 from app.core.utils.time import to_utc_naive, utcnow
 
 TOKEN_REFRESH_INTERVAL_DAYS = 8
+DEFAULT_REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +55,20 @@ def classify_refresh_error(code: str | None) -> bool:
     return code in PERMANENT_FAILURE_CODES
 
 
+def refresh_token_endpoint() -> str:
+    override = os.getenv(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR)
+    if override and override.strip():
+        return override.strip()
+    return DEFAULT_REFRESH_TOKEN_URL
+
+
 async def refresh_access_token(
     refresh_token: str,
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> TokenRefreshResult:
     settings = get_settings()
-    url = f"{settings.auth_base_url.rstrip('/')}/oauth/token"
+    url = refresh_token_endpoint()
     payload = {
         "grant_type": "refresh_token",
         "client_id": settings.oauth_client_id,

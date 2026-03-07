@@ -251,7 +251,7 @@ def _reset_at(reset_at: int | None, reset_after_seconds: int | None, now_epoch: 
     return now_epoch + max(0, int(reset_after_seconds))
 
 
-_DEACTIVATING_USAGE_STATUS_CODES = {402, 403, 404}
+_DEACTIVATING_USAGE_STATUS_CODES = {}
 
 
 def _should_deactivate_for_usage_error(status_code: int) -> bool:
