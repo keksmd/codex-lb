@@ -197,7 +197,7 @@ class LoadBalancer:
         return chosen
 
     async def mark_rate_limit(self, account: Account, error: UpstreamError) -> None:
-        logger.info("Marking account as rate-limited account_id=%s reset_at=%s", account.id, error.reset_at)
+        logger.info("Marking account as rate-limited account_id=%s reset_at=%s", account.id, error.get("resets_at"))
         async with self._runtime_lock:
             state = self._state_for(account)
             handle_rate_limit(state, error)
@@ -205,7 +205,7 @@ class LoadBalancer:
                 await self._sync_state(repos.accounts, account, state)
 
     async def mark_quota_exceeded(self, account: Account, error: UpstreamError) -> None:
-        logger.info("Marking account as quota-exceeded account_id=%s reset_at=%s", account.id, error.reset_at)
+        logger.info("Marking account as quota-exceeded account_id=%s reset_at=%s", account.id, error.get("resets_at"))
         async with self._runtime_lock:
             state = self._state_for(account)
             handle_quota_exceeded(state, error)

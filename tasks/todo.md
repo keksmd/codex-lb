@@ -76,3 +76,12 @@
 - [x] Confirm accounts import submits multiple files to `POST /api/accounts/import/batch`.
 - [x] Confirm the accounts page exposes a zip download action for all auth exports.
 - [x] Confirm frontend tests/mocks match the new endpoint set and response shapes.
+
+## CI Bugfix: Upstream Error Reset Metadata Access
+- [x] Reproduce and isolate the integration failures caused by upstream error reset metadata access in proxy/rate-limit flows.
+- [x] Fix proxy/load-balancer handling so dict-backed `UpstreamError` payloads are consumed safely in all retry and logging paths.
+- [x] Verify the previously failing integration tests pass locally.
+
+## Review (CI Bugfix: Upstream Error Reset Metadata Access)
+- [x] Confirm stream retry, compact error propagation, sticky session failover, and `/v1/responses` flows no longer crash on dict-backed upstream errors.
+- [x] Confirm rate-limit and quota handling still preserve reset metadata when present.
