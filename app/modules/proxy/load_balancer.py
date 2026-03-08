@@ -142,6 +142,8 @@ class LoadBalancer:
         stale_ids = [account_id for account_id in self._runtime if account_id not in account_ids]
         for account_id in stale_ids:
             self._runtime.pop(account_id, None)
+        if stale_ids:
+            logger.debug("Pruned stale runtime state account_ids=%s", stale_ids)
 
     async def _select_with_stickiness(
         self,
@@ -195,6 +197,7 @@ class LoadBalancer:
         return chosen
 
     async def mark_rate_limit(self, account: Account, error: UpstreamError) -> None:
+        logger.info("Marking account as rate-limited account_id=%s reset_at=%s", account.id, error.reset_at)
         async with self._runtime_lock:
             state = self._state_for(account)
             handle_rate_limit(state, error)
@@ -202,6 +205,7 @@ class LoadBalancer:
                 await self._sync_state(repos.accounts, account, state)
 
     async def mark_quota_exceeded(self, account: Account, error: UpstreamError) -> None:
+        logger.info("Marking account as quota-exceeded account_id=%s reset_at=%s", account.id, error.reset_at)
         async with self._runtime_lock:
             state = self._state_for(account)
             handle_quota_exceeded(state, error)
@@ -209,6 +213,7 @@ class LoadBalancer:
                 await self._sync_state(repos.accounts, account, state)
 
     async def mark_permanent_failure(self, account: Account, error_code: str) -> None:
+        logger.info("Marking account as permanently failed account_id=%s error_code=%s", account.id, error_code)
         async with self._runtime_lock:
             state = self._state_for(account)
             handle_permanent_failure(state, error_code)
@@ -220,6 +225,7 @@ class LoadBalancer:
             state = self._state_for(account)
             state.error_count += 1
             state.last_error_at = time.time()
+            logger.debug("Recorded upstream error account_id=%s error_count=%s", account.id, state.error_count)
             async with self._repo_factory() as repos:
                 await self._sync_state(repos.accounts, account, state)
 

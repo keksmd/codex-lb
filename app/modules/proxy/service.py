@@ -97,6 +97,7 @@ class ProxyService:
     ) -> OpenAIResponsePayload:
         _maybe_log_proxy_request_payload("compact", payload, headers)
         _maybe_log_proxy_request_shape("compact", payload, headers)
+        logger.info("Handling compact response request request_id=%s model=%s", ensure_request_id(), payload.model)
         filtered = filter_inbound_headers(headers)
         settings = await get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
@@ -125,6 +126,12 @@ class ProxyService:
 
         try:
             response = await _call_compact(account)
+            logger.info(
+                "Compact response completed request_id=%s account_id=%s model=%s",
+                get_request_id(),
+                account.id,
+                payload.model,
+            )
             await self._settle_compact_api_key_usage(
                 api_key=api_key,
                 api_key_reservation=api_key_reservation,
@@ -177,6 +184,12 @@ class ProxyService:
         prompt: str | None,
         headers: Mapping[str, str],
     ) -> dict[str, JsonValue]:
+        logger.info(
+            "Handling transcription request request_id=%s filename=%s content_type=%s",
+            ensure_request_id(),
+            filename,
+            content_type,
+        )
         filtered = filter_inbound_headers(headers)
         settings = await get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
@@ -208,7 +221,14 @@ class ProxyService:
 
         try:
             account = await self._ensure_fresh(account)
-            return await _call_transcribe(account)
+            response = await _call_transcribe(account)
+            logger.info(
+                "Transcription request completed request_id=%s account_id=%s filename=%s",
+                get_request_id(),
+                account.id,
+                filename,
+            )
+            return response
         except RefreshError as refresh_exc:
             if refresh_exc.is_permanent:
                 await self._load_balancer.mark_permanent_failure(account, refresh_exc.code)
@@ -398,8 +418,22 @@ class ProxyService:
         max_attempts = 3
         settled = False
         settlement = _StreamSettlement()
+        logger.info(
+            "Starting stream request request_id=%s model=%s sticky=%s max_attempts=%s",
+            request_id,
+            payload.model,
+            bool(sticky_key),
+            max_attempts,
+        )
         try:
             for attempt in range(max_attempts):
+                logger.debug(
+                    "Selecting account for stream request request_id=%s attempt=%s/%s model=%s",
+                    request_id,
+                    attempt + 1,
+                    max_attempts,
+                    payload.model,
+                )
                 selection = await self._load_balancer.select_account(
                     sticky_key=sticky_key,
                     prefer_earlier_reset_accounts=prefer_earlier_reset,
@@ -408,6 +442,14 @@ class ProxyService:
                 )
                 account = selection.account
                 if not account:
+                    logger.warning(
+                        "No account available for stream request request_id=%s attempt=%s/%s model=%s error=%s",
+                        request_id,
+                        attempt + 1,
+                        max_attempts,
+                        payload.model,
+                        selection.error_message,
+                    )
                     event = response_failed_event(
                         "no_accounts",
                         selection.error_message or "No active accounts available",
@@ -420,6 +462,14 @@ class ProxyService:
                 try:
                     account = await self._ensure_fresh(account)
                     settlement = _StreamSettlement()
+                    logger.info(
+                        "Proxying stream request request_id=%s attempt=%s/%s account_id=%s model=%s",
+                        request_id,
+                        attempt + 1,
+                        max_attempts,
+                        account.id,
+                        payload.model,
+                    )
                     async for line in self._stream_once(
                         account,
                         payload,
@@ -437,12 +487,35 @@ class ProxyService:
                         settlement,
                         request_id,
                     )
+                    logger.info(
+                        "Stream request completed request_id=%s account_id=%s status=%s input_tokens=%s output_tokens=%s",
+                        request_id,
+                        account.id,
+                        settlement.status,
+                        settlement.input_tokens,
+                        settlement.output_tokens,
+                    )
                     return
                 except _RetryableStreamError as exc:
+                    logger.warning(
+                        "Retryable stream error request_id=%s attempt=%s/%s account_id=%s code=%s",
+                        request_id,
+                        attempt + 1,
+                        max_attempts,
+                        account.id,
+                        exc.code,
+                    )
                     await self._handle_stream_error(account, exc.error, exc.code)
                     continue
                 except ProxyResponseError as exc:
                     if exc.status_code == 401:
+                        logger.info(
+                            "Refreshing account after upstream 401 request_id=%s attempt=%s/%s account_id=%s",
+                            request_id,
+                            attempt + 1,
+                            max_attempts,
+                            account.id,
+                        )
                         try:
                             account = await self._ensure_fresh(account, force=True)
                         except RefreshError as refresh_exc:
@@ -466,6 +539,12 @@ class ProxyService:
                             api_key_reservation,
                             settlement,
                             request_id,
+                        )
+                        logger.info(
+                            "Stream request completed after refresh request_id=%s account_id=%s status=%s",
+                            request_id,
+                            account.id,
+                            settlement.status,
                         )
                         return
                     error = _parse_openai_error(exc.payload)
@@ -493,6 +572,15 @@ class ProxyService:
                 except RefreshError as exc:
                     if exc.is_permanent:
                         await self._load_balancer.mark_permanent_failure(account, exc.code)
+                    logger.warning(
+                        "Account refresh failed during stream request request_id=%s attempt=%s/%s account_id=%s permanent=%s code=%s",
+                        request_id,
+                        attempt + 1,
+                        max_attempts,
+                        account.id,
+                        exc.is_permanent,
+                        exc.code,
+                    )
                     continue
                 except Exception:
                     try:
@@ -512,6 +600,7 @@ class ProxyService:
                         )
                         yield format_sse_event(event)
                         return
+            logger.warning("Stream request exhausted retries request_id=%s model=%s", request_id, payload.model)
             event = response_failed_event(
                 "no_accounts",
                 "No available accounts after retries",
@@ -689,6 +778,7 @@ class ProxyService:
                     )
 
     async def _refresh_usage(self, repos: ProxyRepositories, accounts: list[Account]) -> None:
+        logger.debug("Refreshing usage snapshot for rate limit status account_count=%s", len(accounts))
         latest_usage = await repos.usage.latest_by_account(window="primary")
         updater = UsageUpdater(repos.usage, repos.accounts)
         await updater.refresh_accounts(accounts, latest_usage)
@@ -725,6 +815,7 @@ class ProxyService:
         return [entry for entry in latest.values() if entry.account_id in account_map]
 
     async def _ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
+        logger.debug("Ensuring account freshness account_id=%s force=%s", account.id, force)
         async with self._repo_factory() as repos:
             auth_manager = AuthManager(repos.accounts)
             return await auth_manager.ensure_fresh(account, force=force)
@@ -738,6 +829,7 @@ class ProxyService:
         await self._handle_stream_error(account, _upstream_error_from_openai(error), code)
 
     async def _handle_stream_error(self, account: Account, error: UpstreamError, code: str) -> None:
+        logger.info("Handling upstream proxy error account_id=%s code=%s reset_at=%s", account.id, code, error.reset_at)
         if code in {"rate_limit_exceeded", "usage_limit_reached"}:
             await self._load_balancer.mark_rate_limit(account, error)
             return
