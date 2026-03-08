@@ -1,6 +1,6 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import App from "@/App";
 import { renderWithProviders } from "@/test/utils";
@@ -31,5 +31,35 @@ describe("accounts flow integration", () => {
         expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument();
       });
     }
+  });
+
+  it("supports batch import and auth archive download", async () => {
+    const user = userEvent.setup({ delay: null });
+    const createObjectURL = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:test");
+    const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    window.history.pushState({}, "", "/accounts");
+    renderWithProviders(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Accounts" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Import" }));
+    await user.upload(screen.getByLabelText("Files"), [
+      new File(["{}"], "alpha.json", { type: "application/json" }),
+      new File(["{}"], "beta.json", { type: "application/json" }),
+    ]);
+    await user.click(screen.getAllByRole("button", { name: "Import" })[1]!);
+
+    expect(await screen.findByText("alpha@example.com")).toBeInTheDocument();
+    expect(await screen.findByText("beta@example.com")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "All Auth ZIP" }));
+
+    await waitFor(() => {
+      expect(createObjectURL).toHaveBeenCalledTimes(1);
+      expect(clickSpy).toHaveBeenCalledTimes(1);
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:test");
+    });
   });
 });

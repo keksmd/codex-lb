@@ -3,6 +3,9 @@ import { z } from "zod";
 
 import { LIMIT_TYPES, LIMIT_WINDOWS } from "@/features/api-keys/schemas";
 import {
+  createAccountImportBatchResponse,
+  createAccountImportFailure,
+  createAccountImportResponse,
   createAccountSummary,
   createAccountTrends,
   createApiKey,
@@ -18,8 +21,10 @@ import {
   createOauthStatusResponse,
   createRequestLogFilterOptions,
   createRequestLogsResponse,
+  type AccountImportFailure,
   type AccountSummary,
   type ApiKey,
+  type AccountImportResponse,
   type DashboardAuthSession,
   type DashboardSettings,
   type RequestLogEntry,
@@ -254,20 +259,52 @@ export const handlers = [
     return HttpResponse.json({ accounts: state.accounts });
   }),
 
-  http.post("/api/accounts/import", async () => {
-    const sequence = state.accounts.length + 1;
-    const created = createAccountSummary({
-      accountId: `acc_imported_${sequence}`,
-      email: `imported-${sequence}@example.com`,
-      displayName: `imported-${sequence}@example.com`,
-      status: "active",
-    });
-    state.accounts = [...state.accounts, created];
-    return HttpResponse.json({
-      accountId: created.accountId,
-      email: created.email,
-      planType: created.planType,
-      status: created.status,
+  http.post("/api/accounts/import/batch", async ({ request }) => {
+    const formData = await request.formData();
+    const uploadedFiles = formData.getAll("auth_json").filter((value): value is File => value instanceof File);
+
+    const imported: AccountImportResponse[] = [];
+    const failed: AccountImportFailure[] = [];
+
+    for (const file of uploadedFiles) {
+      if (file.name.toLowerCase().includes("invalid")) {
+        failed.push(
+          createAccountImportFailure({
+            filename: file.name,
+            message: "Invalid auth.json payload",
+          }),
+        );
+        continue;
+      }
+
+      const sequence = state.accounts.length + 1;
+      const created = createAccountSummary({
+        accountId: `acc_imported_${sequence}`,
+        email: `${file.name.replace(/\.json$/i, "")}@example.com`,
+        displayName: `${file.name.replace(/\.json$/i, "")}@example.com`,
+        status: "active",
+      });
+      state.accounts = [...state.accounts, created];
+      imported.push(
+        createAccountImportResponse({
+          filename: file.name,
+          accountId: created.accountId,
+          email: created.email,
+          planType: created.planType,
+          status: created.status,
+        }),
+      );
+    }
+
+    return HttpResponse.json(createAccountImportBatchResponse({ imported, failed }));
+  }),
+
+  http.get("/api/accounts/export", () => {
+    return new HttpResponse(new Uint8Array([80, 75, 3, 4]), {
+      headers: {
+        "Content-Type": "application/zip",
+        "Content-Disposition": 'attachment; filename="auth-export-test.zip"',
+      },
     });
   }),
 

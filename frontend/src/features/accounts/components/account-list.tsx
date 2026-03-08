@@ -1,4 +1,4 @@
-import { Plus, Search, Upload } from "lucide-react";
+import { Download, Plus, Search, Upload } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,8 @@ export type AccountListProps = {
   selectedAccountId: string | null;
   onSelect: (accountId: string) => void;
   onOpenImport: () => void;
+  onDownloadAuthExport: () => void;
+  downloadBusy?: boolean;
   onOpenOauth: () => void;
 };
 
@@ -30,6 +32,8 @@ export function AccountList({
   selectedAccountId,
   onSelect,
   onOpenImport,
+  onDownloadAuthExport,
+  downloadBusy = false,
   onOpenOauth,
 }: AccountListProps) {
   const [search, setSearch] = useState("");
@@ -80,10 +84,21 @@ export function AccountList({
         </Select>
       </div>
 
-      <div className="flex gap-2">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
         <Button type="button" size="sm" variant="outline" onClick={onOpenImport} className="h-8 flex-1 gap-1.5 text-xs">
           <Upload className="h-3.5 w-3.5" />
           Import
+        </Button>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={onDownloadAuthExport}
+          disabled={downloadBusy || accounts.length === 0}
+          className="h-8 flex-1 gap-1.5 text-xs"
+        >
+          <Download className="h-3.5 w-3.5" />
+          All Auth ZIP
         </Button>
         <Button type="button" size="sm" onClick={onOpenOauth} className="h-8 flex-1 gap-1.5 text-xs">
           <Plus className="h-3.5 w-3.5" />

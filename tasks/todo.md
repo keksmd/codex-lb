@@ -26,3 +26,53 @@
 ## Review (CI Bugfix: SPA Static Dir And Usage Deactivation)
 - [x] Confirm SPA fallback still returns `503` with the frontend build hint when `index.html` is missing.
 - [x] Confirm usage updater does not auto-deactivate on `402`, `401`, `429`, or `5xx`.
+
+## Deployment Incident: codex-proxy-prod
+- [x] Reproduce the live deployment failure from readonly cluster inspection.
+- [x] Fix image/runtime assumptions that block the app in Kubernetes.
+- [x] Fix Argo-managed storage, env, and healthcheck wiring for `codex-proxy`.
+- [x] Verify local rendering/tests for the deployment changes.
+- [x] Confirm the live rollout becomes healthy after Argo sync.
+
+## Review (Deployment Incident: codex-proxy-prod)
+- [x] Confirm migrations target a writable persistent path in-cluster.
+- [x] Confirm the app binds the same port that the service and probes target.
+- [x] Confirm the rendered Helm manifest includes a valid PVC mount and valid `db-dir` volume source.
+
+## Logging Cleanup In Container
+- [x] Remove noisy uvicorn access logs from the runtime/container startup path.
+- [x] Ensure application logs are emitted to container stdout/stderr with a predictable format and level.
+- [x] Add `info`/`debug` logs to key startup and proxy service paths if current coverage is insufficient.
+- [x] Verify the resulting runtime output locally so container-visible app logs remain while access logs are suppressed.
+
+## Review (Logging Cleanup In Container)
+- [x] Confirm `uvicorn.access` no longer emits per-request access lines in the default app startup path.
+- [x] Confirm application lifecycle logs appear during startup/shutdown.
+- [x] Confirm proxy/service request handling still emits useful app-level logs for debugging without excessive noise.
+
+## Auth Import/Export Improvements
+- [x] Create OpenSpec change for multi-file auth import, import-time refresh, and zip export.
+- [x] Update dashboard/backend specs and task notes for the new account import/export behavior.
+- [x] Implement backend multi-file import response flow with per-file success/failure reporting.
+- [x] Refresh imported auth immediately when the access token is expired but refresh token is still usable.
+- [x] Add backend zip export endpoint that packages current account auth payloads with current tokens.
+- [x] Update frontend account import dialog and mutations for multi-file upload.
+- [x] Add frontend download action for exporting all current auth payloads as zip.
+- [ ] Verify backend/frontend tests covering batch import, import-time refresh, and zip export.
+
+## Review (Auth Import/Export Improvements)
+- [x] Confirm the frontend batch import uses a dedicated batch endpoint without regressing the single-file import contract.
+- [x] Confirm an imported file with expired access token and valid refresh token is persisted with refreshed tokens immediately.
+- [x] Confirm the export action downloads a zip containing one current auth payload per account.
+
+## Frontend: Accounts Batch Import UX
+- [x] Update frontend accounts API/schemas to use batch import and auth zip download endpoints.
+- [x] Replace single-file import dialog with multi-file import UX on the accounts page.
+- [x] Add blob download helper if needed and wire the "download all auth" action.
+- [x] Update frontend tests and MSW mocks to the new accounts import/download contract.
+- [ ] Verify targeted frontend tests pass locally.
+
+## Review (Frontend: Accounts Batch Import UX)
+- [x] Confirm accounts import submits multiple files to `POST /api/accounts/import/batch`.
+- [x] Confirm the accounts page exposes a zip download action for all auth exports.
+- [x] Confirm frontend tests/mocks match the new endpoint set and response shapes.
