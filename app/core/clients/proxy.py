@@ -13,6 +13,7 @@ import aiohttp
 
 from app.core.clients.http import get_http_client
 from app.core.config.settings import get_settings
+from app.core.clients.http import get_http_proxy_request_kwargs
 from app.core.errors import OpenAIErrorEnvelope, ResponseFailedEvent, openai_error, response_failed_event
 from app.core.openai.models import OpenAIResponsePayload
 from app.core.openai.parsing import parse_error_payload, parse_response_payload, parse_sse_event
@@ -611,6 +612,7 @@ async def stream_responses(
 
     seen_terminal = False
     client_session = session or get_http_client().session
+    proxy_kwargs = await get_http_proxy_request_kwargs()
     payload_dict = payload.to_payload()
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
@@ -624,6 +626,7 @@ async def stream_responses(
             json=payload_dict,
             headers=upstream_headers,
             timeout=timeout,
+            **proxy_kwargs,
         ) as resp:
             if resp.status >= 400:
                 if raise_for_status:
@@ -709,6 +712,7 @@ async def compact_responses(
     )
 
     client_session = session or get_http_client().session
+    proxy_kwargs = await get_http_proxy_request_kwargs()
     payload_dict = payload.to_payload()
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
@@ -722,6 +726,7 @@ async def compact_responses(
             json=payload_dict,
             headers=upstream_headers,
             timeout=timeout,
+            **proxy_kwargs,
         ) as resp:
             if resp.status >= 400:
                 error_payload = await _error_payload_from_response(resp)
@@ -798,12 +803,14 @@ async def transcribe_audio(
         form.add_field("prompt", prompt)
 
     client_session = session or get_http_client().session
+    proxy_kwargs = await get_http_proxy_request_kwargs()
     try:
         async with client_session.post(
             url,
             data=form,
             headers=upstream_headers,
             timeout=timeout,
+            **proxy_kwargs,
         ) as resp:
             if resp.status >= 400:
                 error_payload = await _error_payload_from_response(resp)

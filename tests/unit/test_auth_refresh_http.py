@@ -36,11 +36,22 @@ class _FakeSession:
         self._response = response
         self.captured_url: str | None = None
         self.captured_json: dict[str, object] | None = None
+        self.captured_proxy: str | None = None
 
-    def post(self, url: str, *, json, headers, timeout):  # noqa: ANN001
+    def post(self, url: str, *, json, headers, timeout, proxy=None):  # noqa: ANN001
         self.captured_url = url
         self.captured_json = json
+        self.captured_proxy = proxy
         return self._response
+
+
+class _FakeSettingsRow:
+    http_proxy_url = "http://dashboard.proxy:3128"
+
+
+class _FakeSettingsCache:
+    async def get(self) -> _FakeSettingsRow:
+        return _FakeSettingsRow()
 
 
 def test_refresh_token_endpoint_uses_default_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,3 +91,45 @@ async def test_refresh_access_token_posts_refresh_payload(monkeypatch: pytest.Mo
     assert fake.captured_json["grant_type"] == "refresh_token"
     assert fake.captured_json["refresh_token"] == "old-refresh-token"
     assert fake.captured_json["scope"] == "openid profile email"
+    assert fake.captured_proxy is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_uses_env_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_LB_HTTP_PROXY_URL", "http://env.proxy:8080")
+    refresh_module.get_settings.cache_clear()
+    fake = _FakeSession(
+        _FakeResponse(
+            status=200,
+            payload={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "id_token": "new-id-token",
+            },
+        )
+    )
+
+    await refresh_access_token("old-refresh-token", session=fake)
+
+    assert fake.captured_proxy == "http://env.proxy:8080"
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_uses_dashboard_http_proxy_when_env_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEX_LB_HTTP_PROXY_URL", raising=False)
+    refresh_module.get_settings.cache_clear()
+    monkeypatch.setattr("app.core.clients.http.get_settings_cache", lambda: _FakeSettingsCache())
+    fake = _FakeSession(
+        _FakeResponse(
+            status=200,
+            payload={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "id_token": "new-id-token",
+            },
+        )
+    )
+
+    await refresh_access_token("old-refresh-token", session=fake)
+
+    assert fake.captured_proxy == "http://dashboard.proxy:3128"

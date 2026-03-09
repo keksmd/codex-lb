@@ -67,6 +67,7 @@ const SettingsPayloadSchema = z.object({
   preferEarlierResetAccounts: z.boolean().optional(),
   routingStrategy: z.enum(["usage_weighted", "round_robin"]).optional(),
   importWithoutOverwrite: z.boolean().optional(),
+  httpProxyUrl: z.string().url().nullable().optional(),
   totpRequiredOnLogin: z.boolean().optional(),
   totpConfigured: z.boolean().optional(),
   apiKeyAuthEnabled: z.boolean().optional(),

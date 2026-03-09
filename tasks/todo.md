@@ -85,3 +85,24 @@
 ## Review (CI Bugfix: Upstream Error Reset Metadata Access)
 - [x] Confirm stream retry, compact error propagation, sticky session failover, and `/v1/responses` flows no longer crash on dict-backed upstream errors.
 - [x] Confirm rate-limit and quota handling still preserve reset metadata when present.
+
+## Usage/Auth/Proxy Bugfixes
+- [x] Sanitize usage-fetch 403 failures so logs/errors do not dump upstream HTML bodies.
+- [x] Fix account token status display so stored refresh tokens do not leave the account shown as only `Expired`.
+- [x] Add an HTTP proxy option through the dashboard settings flow and apply it to outbound HTTP clients.
+- [x] Add/update backend and frontend tests for the new behavior.
+- [ ] Verify targeted backend and frontend tests pass locally.
+
+## Review (Usage/Auth/Proxy Bugfixes)
+- [x] Confirm a 403 usage fetch surfaces a compact message without embedding full HTML response bodies.
+- [x] Confirm accounts with expired access tokens but stored refresh tokens show recoverable token state in the UI.
+- [x] Confirm the configured HTTP proxy setting is persisted by `/api/settings` and used by outbound HTTP requests.
+
+## Testcontainers Migration Bootstrap
+- [x] Reproduce the backend test fixture failure mode where testcontainer databases start without migrated tables.
+- [x] Change the shared backend test reset fixtures to rebuild schema through Alembic migrations instead of ORM `create_all`.
+- [x] Verify representative backend tests pass against the migrated fixture flow.
+
+## Review (Testcontainers Migration Bootstrap)
+- [x] Confirm `db_setup` and app-backed integration fixtures create schema via `run_startup_migrations()`.
+- [x] Confirm tests no longer depend on `Base.metadata.create_all()` bypassing migrations, except the dedicated raw migration fixture used to exercise legacy bootstrap paths.

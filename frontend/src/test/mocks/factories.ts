@@ -303,6 +303,7 @@ export function createDashboardSettings(overrides: Partial<DashboardSettings> = 
     preferEarlierResetAccounts: false,
     routingStrategy: "usage_weighted",
     importWithoutOverwrite: false,
+    httpProxyUrl: null,
     totpRequiredOnLogin: false,
     totpConfigured: true,
     apiKeyAuthEnabled: true,

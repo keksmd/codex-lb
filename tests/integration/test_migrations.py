@@ -47,7 +47,7 @@ def _make_account(account_id: str, email: str, plan_type: str) -> Account:
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_preserves_unknown_plan_types(db_setup):
+async def test_run_startup_migrations_preserves_unknown_plan_types(raw_db_setup):
     async with SessionLocal() as session:
         repo = AccountsRepository(session)
         await repo.upsert(_make_account("acc_one", "one@example.com", "education"))
@@ -74,7 +74,7 @@ async def test_run_startup_migrations_preserves_unknown_plan_types(db_setup):
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_bootstraps_legacy_history(db_setup):
+async def test_run_startup_migrations_bootstraps_legacy_history(raw_db_setup):
     async with SessionLocal() as session:
         await session.execute(
             text(
@@ -105,7 +105,7 @@ async def test_run_startup_migrations_bootstraps_legacy_history(db_setup):
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_skips_legacy_stamp_when_required_tables_missing(db_setup):
+async def test_run_startup_migrations_skips_legacy_stamp_when_required_tables_missing(raw_db_setup):
     async with SessionLocal() as session:
         await session.execute(text("DROP TABLE dashboard_settings"))
         await session.execute(
@@ -136,7 +136,7 @@ async def test_run_startup_migrations_skips_legacy_stamp_when_required_tables_mi
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_handles_unknown_legacy_rows(db_setup):
+async def test_run_startup_migrations_handles_unknown_legacy_rows(raw_db_setup):
     async with SessionLocal() as session:
         await session.execute(
             text(
@@ -166,7 +166,7 @@ async def test_run_startup_migrations_handles_unknown_legacy_rows(db_setup):
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_auto_remaps_legacy_alembic_revision_ids(db_setup):
+async def test_run_startup_migrations_auto_remaps_legacy_alembic_revision_ids(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
     legacy_head = "013_add_dashboard_settings_routing_strategy"
@@ -184,7 +184,7 @@ async def test_run_startup_migrations_auto_remaps_legacy_alembic_revision_ids(db
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_auto_remaps_firewall_legacy_revision_id(db_setup):
+async def test_run_startup_migrations_auto_remaps_firewall_legacy_revision_id(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
     legacy_firewall_revision = "014_add_api_firewall_allowlist"
@@ -205,7 +205,7 @@ async def test_run_startup_migrations_auto_remaps_firewall_legacy_revision_id(db
 
 
 @pytest.mark.asyncio
-async def test_run_startup_migrations_handles_legacy_schema_table_and_legacy_alembic_id_together(db_setup):
+async def test_run_startup_migrations_handles_legacy_schema_table_and_legacy_alembic_id_together(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
     async with SessionLocal() as session:
@@ -237,7 +237,7 @@ async def test_run_startup_migrations_handles_legacy_schema_table_and_legacy_ale
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only migration contract test")
-async def test_postgresql_migration_contract_policy_and_drift_match(db_setup):
+async def test_postgresql_migration_contract_policy_and_drift_match(raw_db_setup):
     result = await run_startup_migrations(_DATABASE_URL)
     assert result.current_revision == _HEAD_REVISION
 
@@ -247,7 +247,7 @@ async def test_postgresql_migration_contract_policy_and_drift_match(db_setup):
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only migration remap test")
-async def test_postgresql_startup_migration_auto_remap_legacy_head(db_setup):
+async def test_postgresql_startup_migration_auto_remap_legacy_head(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
     async with SessionLocal() as session:
@@ -436,6 +436,10 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
                 await session.execute(text("SELECT routing_strategy FROM dashboard_settings WHERE id=1"))
             ).scalar_one()
             assert routing_strategy == "usage_weighted"
+            http_proxy_url = (
+                await session.execute(text("SELECT http_proxy_url FROM dashboard_settings WHERE id=1"))
+            ).scalar_one()
+            assert http_proxy_url is None
             index_rows = (await session.execute(text("PRAGMA index_list(accounts)"))).fetchall()
             has_email_non_unique_index = False
             for row in index_rows:
