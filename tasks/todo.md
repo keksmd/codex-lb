@@ -106,3 +106,16 @@
 ## Review (Testcontainers Migration Bootstrap)
 - [x] Confirm `db_setup` and app-backed integration fixtures create schema via `run_startup_migrations()`.
 - [x] Confirm tests no longer depend on `Base.metadata.create_all()` bypassing migrations, except the dedicated raw migration fixture used to exercise legacy bootstrap paths.
+
+## Optional Proxy API Key Header (`X-Codex-Proxy-Key`)
+- [x] Keep `Authorization: Bearer` validation as the primary proxy auth mechanism.
+- [x] Add `X-Codex-Proxy-Key` as an optional additional guard (enabled via env config).
+- [x] Enforce that when optional proxy-key guard is enabled, requests must provide a matching `X-Codex-Proxy-Key` value.
+- [x] Add integration/unit tests covering valid/invalid/missing/misconfigured optional proxy-key guard behavior.
+- [x] Verify targeted auth/config tests pass.
+
+## Review (Optional Proxy API Key Header)
+- [x] Confirm `Authorization: Bearer <key>` continues to work.
+- [x] Confirm `X-Codex-Proxy-Key` is not an alternative bearer credential path.
+- [x] Confirm when proxy-key guard is enabled, valid bearer + valid `X-Codex-Proxy-Key` is required.
+- [x] Confirm misconfigured enabled guard (no configured key) fails closed.

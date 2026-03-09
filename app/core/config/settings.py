@@ -86,6 +86,8 @@ class Settings(BaseSettings):
     firewall_trusted_proxy_cidrs: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["127.0.0.1/32", "::1/128"]
     )
+    proxy_key_auth_enabled: bool = False
+    proxy_key: str | None = None
 
     @field_validator("database_url")
     @classmethod
@@ -157,6 +159,16 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return normalize_http_proxy_url(value)
         raise TypeError("http_proxy_url must be a string")
+
+    @field_validator("proxy_key", mode="before")
+    @classmethod
+    def _normalize_proxy_key(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            key = value.strip()
+            return key or None
+        raise TypeError("proxy_key must be a string")
 
 
 @lru_cache(maxsize=1)
