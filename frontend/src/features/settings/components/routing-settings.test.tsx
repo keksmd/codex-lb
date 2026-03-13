@@ -12,6 +12,7 @@ const BASE_SETTINGS: DashboardSettings = {
   routingStrategy: "usage_weighted",
   openaiCacheAffinityMaxAgeSeconds: 300,
   importWithoutOverwrite: false,
+  httpProxyUrl: null,
   totpRequiredOnLogin: false,
   totpConfigured: false,
   apiKeyAuthEnabled: true,

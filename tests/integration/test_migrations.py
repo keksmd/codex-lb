@@ -532,55 +532,55 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
         ).scalar_one()
         assert sticky_same_key_count == 2
         index_rows = (await session.execute(text("PRAGMA index_list(accounts)"))).fetchall()
-            has_email_non_unique_index = False
-            for row in index_rows:
-                if len(row) < 3:
-                    continue
-                index_name = str(row[1])
-                is_unique = bool(row[2])
-                escaped_name = index_name.replace('"', '""')
-                index_info_rows = (await session.execute(text(f'PRAGMA index_info("{escaped_name}")'))).fetchall()
-                column_names = [str(info[2]) for info in index_info_rows if len(info) > 2]
-                if column_names == ["email"] and not is_unique:
-                    has_email_non_unique_index = True
-                    break
-            assert has_email_non_unique_index
-            usage_index_rows = (await session.execute(text("PRAGMA index_list(usage_history)"))).fetchall()
-            usage_index_names = {str(row[1]) for row in usage_index_rows if len(row) > 1}
-            assert "idx_usage_window_account_latest" in usage_index_names
-            request_log_index_rows = (await session.execute(text("PRAGMA index_list(request_logs)"))).fetchall()
-            request_log_index_names = {str(row[1]) for row in request_log_index_rows if len(row) > 1}
-            assert "idx_logs_requested_at_id" in request_log_index_names
+        has_email_non_unique_index = False
+        for row in index_rows:
+            if len(row) < 3:
+                continue
+            index_name = str(row[1])
+            is_unique = bool(row[2])
+            escaped_name = index_name.replace('"', '""')
+            index_info_rows = (await session.execute(text(f'PRAGMA index_info("{escaped_name}")'))).fetchall()
+            column_names = [str(info[2]) for info in index_info_rows if len(info) > 2]
+            if column_names == ["email"] and not is_unique:
+                has_email_non_unique_index = True
+                break
+        assert has_email_non_unique_index
+        usage_index_rows = (await session.execute(text("PRAGMA index_list(usage_history)"))).fetchall()
+        usage_index_names = {str(row[1]) for row in usage_index_rows if len(row) > 1}
+        assert "idx_usage_window_account_latest" in usage_index_names
+        request_log_index_rows = (await session.execute(text("PRAGMA index_list(request_logs)"))).fetchall()
+        request_log_index_names = {str(row[1]) for row in request_log_index_rows if len(row) > 1}
+        assert "idx_logs_requested_at_id" in request_log_index_names
 
-            await session.execute(
-                text(
-                    """
-                    INSERT INTO accounts (
-                        id, chatgpt_account_id, email, plan_type,
-                        access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
-                        last_refresh, created_at, status, deactivation_reason, reset_at
-                    )
-                    VALUES (
-                        'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
-                        x'11', x'12', x'13',
-                        '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
-                    )
-                    """
+        await session.execute(
+            text(
+                """
+                INSERT INTO accounts (
+                    id, chatgpt_account_id, email, plan_type,
+                    access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
+                    last_refresh, created_at, status, deactivation_reason, reset_at
                 )
+                VALUES (
+                    'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
+                    x'11', x'12', x'13',
+                    '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
+                )
+                """
             )
-            usage_count = (
-                await session.execute(text("SELECT COUNT(*) FROM usage_history WHERE account_id='acc_legacy'"))
-            ).scalar_one()
-            logs_count = (
-                await session.execute(text("SELECT COUNT(*) FROM request_logs WHERE account_id='acc_legacy'"))
-            ).scalar_one()
-            sticky_count = (
-                await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE account_id='acc_legacy'"))
-            ).scalar_one()
-            await session.commit()
+        )
+        usage_count = (
+            await session.execute(text("SELECT COUNT(*) FROM usage_history WHERE account_id='acc_legacy'"))
+        ).scalar_one()
+        logs_count = (
+            await session.execute(text("SELECT COUNT(*) FROM request_logs WHERE account_id='acc_legacy'"))
+        ).scalar_one()
+        sticky_count = (
+            await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE account_id='acc_legacy'"))
+        ).scalar_one()
+        await session.commit()
 
-            assert usage_count == 1
-            assert logs_count == 1
-            assert sticky_count == 2
+        assert usage_count == 1
+        assert logs_count == 1
+        assert sticky_count == 2
     finally:
         await engine.dispose()

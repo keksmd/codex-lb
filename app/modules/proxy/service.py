@@ -275,21 +275,21 @@ class ProxyService:
                     actual_service_tier = _service_tier_from_response(response)
                     await self._load_balancer.record_success(account)
                     logger.info(
-                "Compact response completed request_id=%s account_id=%s model=%s",
-                get_request_id(),
-                account.id,
-                payload.model,
-            )
-                await self._settle_compact_api_key_usage(
-                    api_key=api_key,
-                    api_key_reservation=api_key_reservation,
-                    response=response,
-                request_service_tier=request_service_tier,
+                        "Compact response completed request_id=%s account_id=%s model=%s",
+                        get_request_id(),
+                        account.id,
+                        payload.model,
                     )
-                log_status = "success"
-                return response
-            except ProxyResponseError as exc:
-                if exc.status_code == 401:
+                    await self._settle_compact_api_key_usage(
+                        api_key=api_key,
+                        api_key_reservation=api_key_reservation,
+                        response=response,
+                        request_service_tier=request_service_tier,
+                    )
+                    log_status = "success"
+                    return response
+                except ProxyResponseError as exc:
+                    if exc.status_code == 401:
                         if refresh_retry_used:
                             await self._settle_compact_api_key_usage(
                                 api_key=api_key,
@@ -1849,7 +1849,7 @@ class ProxyService:
             "Starting stream request request_id=%s model=%s sticky=%s max_attempts=%s",
             request_id,
             payload.model,
-            bool(sticky_key),
+            bool(affinity.key),
             max_attempts,
         )
         try:

@@ -570,7 +570,7 @@ def _parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     upgrade_parser = subparsers.add_parser("upgrade", help="Upgrade schema to a target revision.")
-    upgrade_parser.add_argument("revision", nargs="?", default="head")
+    upgrade_parser.add_argument("revision", nargs="?", default="heads")
     upgrade_parser.add_argument(
         "--no-bootstrap-legacy",
         action="store_true",
