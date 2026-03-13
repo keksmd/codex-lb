@@ -11,6 +11,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { buildSettingsUpdateRequest } from "@/features/settings/payload";
 import type { DashboardSettings, SettingsUpdateRequest } from "@/features/settings/schemas";
 
 export type RoutingSettingsProps = {
@@ -21,21 +22,24 @@ export type RoutingSettingsProps = {
 
 export function RoutingSettings({ settings, busy, onSave }: RoutingSettingsProps) {
   const [httpProxyUrl, setHttpProxyUrl] = useState(settings.httpProxyUrl ?? "");
+  const [cacheAffinityTtl, setCacheAffinityTtl] = useState(String(settings.openaiCacheAffinityMaxAgeSeconds));
 
   useEffect(() => {
     setHttpProxyUrl(settings.httpProxyUrl ?? "");
   }, [settings.httpProxyUrl]);
 
+  useEffect(() => {
+    setCacheAffinityTtl(String(settings.openaiCacheAffinityMaxAgeSeconds));
+  }, [settings.openaiCacheAffinityMaxAgeSeconds]);
+
   const save = (patch: Partial<SettingsUpdateRequest>) =>
-    void onSave({
-      stickyThreadsEnabled: settings.stickyThreadsEnabled,
-      preferEarlierResetAccounts: settings.preferEarlierResetAccounts,
-      routingStrategy: settings.routingStrategy,
-      httpProxyUrl: settings.httpProxyUrl,
-      totpRequiredOnLogin: settings.totpRequiredOnLogin,
-      apiKeyAuthEnabled: settings.apiKeyAuthEnabled,
-      ...patch,
-    });
+    void onSave(buildSettingsUpdateRequest(settings, patch));
+
+  const parsedCacheAffinityTtl = Number.parseInt(cacheAffinityTtl, 10);
+  const cacheAffinityTtlValid = Number.isInteger(parsedCacheAffinityTtl) && parsedCacheAffinityTtl > 0;
+  const cacheAffinityTtlChanged =
+    cacheAffinityTtlValid && parsedCacheAffinityTtl !== settings.openaiCacheAffinityMaxAgeSeconds;
+
   const trimmedHttpProxyUrl = httpProxyUrl.trim();
   const savedHttpProxyUrl = settings.httpProxyUrl ?? "";
   const proxyDirty = trimmedHttpProxyUrl !== savedHttpProxyUrl;
@@ -60,6 +64,31 @@ export function RoutingSettings({ settings, busy, onSave }: RoutingSettingsProps
         </div>
 
         <div className="divide-y rounded-lg border">
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div>
+              <p className="text-sm font-medium">Upstream stream transport</p>
+              <p className="text-xs text-muted-foreground">
+                Choose how `codex-lb` connects upstream for streaming responses.
+              </p>
+            </div>
+            <Select
+              value={settings.upstreamStreamTransport}
+              onValueChange={(value) =>
+                save({ upstreamStreamTransport: value as "default" | "auto" | "http" | "websocket" })
+              }
+            >
+              <SelectTrigger className="h-8 w-44 text-xs" disabled={busy}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="end">
+                <SelectItem value="default">Server default</SelectItem>
+                <SelectItem value="auto">Auto</SelectItem>
+                <SelectItem value="http">Responses</SelectItem>
+                <SelectItem value="websocket">WebSockets</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
           <div className="flex items-center justify-between gap-4 p-3">
             <div>
               <p className="text-sm font-medium">Routing strategy</p>
@@ -101,6 +130,42 @@ export function RoutingSettings({ settings, busy, onSave }: RoutingSettingsProps
               disabled={busy}
               onCheckedChange={(checked) => save({ preferEarlierResetAccounts: checked })}
             />
+          </div>
+
+          <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-sm font-medium">Prompt-cache affinity TTL</p>
+              <p className="text-xs text-muted-foreground">
+                Keep OpenAI-style prompt-cache mappings warm for a bounded number of seconds.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={cacheAffinityTtl}
+                disabled={busy}
+                onChange={(event) => setCacheAffinityTtl(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && cacheAffinityTtlChanged) {
+                    void save({ openaiCacheAffinityMaxAgeSeconds: parsedCacheAffinityTtl });
+                  }
+                }}
+                className="h-8 w-28 text-xs"
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-8 text-xs"
+                disabled={busy || !cacheAffinityTtlChanged}
+                onClick={() => void save({ openaiCacheAffinityMaxAgeSeconds: parsedCacheAffinityTtl })}
+              >
+                Save TTL
+              </Button>
+            </div>
           </div>
 
           <div className="flex items-center justify-between gap-4 p-3">

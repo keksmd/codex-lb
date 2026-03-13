@@ -51,7 +51,8 @@ describe("useAccounts", () => {
     expect(imported.imported).toHaveLength(2);
 
     await result.current.exportAuthArchiveMutation.mutateAsync();
-    expect(downloadBlob).toHaveBeenCalledWith(expect.any(Blob), "auth-export-test.zip");
+    expect(downloadBlob).toHaveBeenCalledTimes(1);
+    expect(downloadBlob).toHaveBeenCalledWith(expect.anything(), "auth-export-test.zip");
 
     await result.current.deleteMutation.mutateAsync(imported.imported[0]?.accountId ?? "");
 

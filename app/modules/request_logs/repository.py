@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
 import anyio
@@ -10,7 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.usage.types import BucketModelAggregate
 from app.core.utils.request_id import ensure_request_id
 from app.core.utils.time import utcnow
-from app.db.models import Account, RequestLog
+from app.db.models import Account, ApiKey, RequestLog
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestLogFilters:
+    conditions: list
+    needs_related_search_joins: bool
 
 
 class RequestLogsRepository:
@@ -40,6 +47,7 @@ class RequestLogsRepository:
             select(
                 bucket_col,
                 RequestLog.model,
+                RequestLog.service_tier,
                 func.count().label("request_count"),
                 func.sum(cast(RequestLog.status != literal_column("'success'"), Integer)).label("error_count"),
                 func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
@@ -48,7 +56,7 @@ class RequestLogsRepository:
                 func.coalesce(func.sum(RequestLog.reasoning_tokens), 0).label("reasoning_tokens"),
             )
             .where(RequestLog.requested_at >= since)
-            .group_by(bucket_col, RequestLog.model)
+            .group_by(bucket_col, RequestLog.model, RequestLog.service_tier)
             .order_by(bucket_col)
         )
         result = await self._session.execute(stmt)
@@ -56,6 +64,7 @@ class RequestLogsRepository:
             BucketModelAggregate(
                 bucket_epoch=int(row.bucket_epoch),
                 model=row.model,
+                service_tier=row.service_tier,
                 request_count=int(row.request_count),
                 error_count=int(row.error_count),
                 input_tokens=int(row.input_tokens),
@@ -68,7 +77,7 @@ class RequestLogsRepository:
 
     async def add_log(
         self,
-        account_id: str,
+        account_id: str | None,
         request_id: str,
         model: str,
         input_tokens: int | None,
@@ -81,6 +90,8 @@ class RequestLogsRepository:
         cached_input_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         reasoning_effort: str | None = None,
+        service_tier: str | None = None,
+        transport: str | None = None,
         api_key_id: str | None = None,
     ) -> RequestLog:
         resolved_request_id = ensure_request_id(request_id)
@@ -89,6 +100,8 @@ class RequestLogsRepository:
             api_key_id=api_key_id,
             request_id=resolved_request_id,
             model=model,
+            transport=transport,
+            service_tier=service_tier,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
@@ -127,7 +140,7 @@ class RequestLogsRepository:
         error_codes_in: list[str] | None = None,
         error_codes_excluding: list[str] | None = None,
     ) -> tuple[list[RequestLog], int]:
-        conditions = self._build_filters(
+        filters = self._build_filters(
             search=search,
             since=since,
             until=until,
@@ -142,13 +155,10 @@ class RequestLogsRepository:
         )
 
         total_col = func.count().over().label("_total")
-        stmt = (
-            select(RequestLog, total_col)
-            .outerjoin(Account, Account.id == RequestLog.account_id)
-            .order_by(RequestLog.requested_at.desc())
-        )
-        if conditions:
-            stmt = stmt.where(and_(*conditions))
+        stmt = select(RequestLog, total_col).order_by(RequestLog.requested_at.desc(), RequestLog.id.desc())
+        stmt = self._apply_related_search_joins(stmt, filters.needs_related_search_joins)
+        if filters.conditions:
+            stmt = stmt.where(and_(*filters.conditions))
         if offset:
             stmt = stmt.offset(offset)
         if limit:
@@ -156,19 +166,16 @@ class RequestLogsRepository:
         result = await self._session.execute(stmt)
         rows = result.all()
         if not rows:
-            return [], await self._count_recent(conditions)
+            return [], await self._count_recent(filters)
         logs = [row[0] for row in rows]
         total = rows[0][1]
         return logs, total
 
-    async def _count_recent(self, conditions: list) -> int:
-        count_stmt = (
-            select(func.count(RequestLog.id))
-            .select_from(RequestLog)
-            .outerjoin(Account, Account.id == RequestLog.account_id)
-        )
-        if conditions:
-            count_stmt = count_stmt.where(and_(*conditions))
+    async def _count_recent(self, filters: _RequestLogFilters) -> int:
+        count_stmt = select(func.count(RequestLog.id)).select_from(RequestLog)
+        count_stmt = self._apply_related_search_joins(count_stmt, filters.needs_related_search_joins)
+        if filters.conditions:
+            count_stmt = count_stmt.where(and_(*filters.conditions))
         result = await self._session.execute(count_stmt)
         return int(result.scalar_one())
 
@@ -181,7 +188,7 @@ class RequestLogsRepository:
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
     ) -> tuple[list[str], list[tuple[str, str | None]], list[tuple[str, str | None]]]:
-        conditions = self._build_filters(
+        filters = self._build_filters(
             since=since,
             until=until,
             account_ids=account_ids,
@@ -205,8 +212,8 @@ class RequestLogsRepository:
             .distinct()
             .order_by(RequestLog.status.asc(), RequestLog.error_code.asc())
         )
-        if conditions:
-            clause = and_(*conditions)
+        if filters.conditions:
+            clause = and_(*filters.conditions)
             account_stmt = account_stmt.where(clause)
             model_stmt = model_stmt.where(clause)
             status_stmt = status_stmt.where(clause)
@@ -219,6 +226,13 @@ class RequestLogsRepository:
         model_options = [(row[0], row[1]) for row in model_rows.all() if row[0]]
         status_values = [(row[0], row[1]) for row in status_rows.all() if row[0]]
         return account_ids, model_options, status_values
+
+    async def get_api_key_names_by_ids(self, api_key_ids: list[str]) -> dict[str, str]:
+        unique_ids = sorted({key_id for key_id in api_key_ids if key_id})
+        if not unique_ids:
+            return {}
+        result = await self._session.execute(select(ApiKey.id, ApiKey.name).where(ApiKey.id.in_(unique_ids)))
+        return {key_id: name for key_id, name in result.all() if key_id and name}
 
     def _build_filters(
         self,
@@ -234,7 +248,7 @@ class RequestLogsRepository:
         include_error_other: bool = True,
         error_codes_in: list[str] | None = None,
         error_codes_excluding: list[str] | None = None,
-    ) -> list:
+    ) -> _RequestLogFilters:
         conditions = []
         if since is not None:
             conditions.append(RequestLog.requested_at >= since)
@@ -290,6 +304,8 @@ class RequestLogsRepository:
                     RequestLog.status.ilike(search_pattern),
                     RequestLog.error_code.ilike(search_pattern),
                     RequestLog.error_message.ilike(search_pattern),
+                    RequestLog.api_key_id.ilike(search_pattern),
+                    ApiKey.name.ilike(search_pattern),
                     cast(RequestLog.requested_at, String).ilike(search_pattern),
                     cast(RequestLog.input_tokens, String).ilike(search_pattern),
                     cast(RequestLog.output_tokens, String).ilike(search_pattern),
@@ -298,7 +314,16 @@ class RequestLogsRepository:
                     cast(RequestLog.latency_ms, String).ilike(search_pattern),
                 )
             )
-        return conditions
+            return _RequestLogFilters(conditions=conditions, needs_related_search_joins=True)
+        return _RequestLogFilters(conditions=conditions, needs_related_search_joins=False)
+
+    def _apply_related_search_joins(self, stmt, include_related_search_joins: bool):
+        if not include_related_search_joins:
+            return stmt
+        return stmt.outerjoin(Account, Account.id == RequestLog.account_id).outerjoin(
+            ApiKey,
+            ApiKey.id == RequestLog.api_key_id,
+        )
 
 
 async def _safe_rollback(session: AsyncSession) -> None:

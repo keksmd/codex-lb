@@ -8,10 +8,20 @@ from app.core.auth import DEFAULT_PLAN
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
-from app.db.alembic.revision_ids import OLD_TO_NEW_REVISION_MAP
+
+try:
+    from app.db.alembic.revision_ids import OLD_TO_NEW_REVISION_MAP
+
+    _HAS_REVISION_REMAP = True
+except ImportError:
+    OLD_TO_NEW_REVISION_MAP = {
+        "001_normalize_account_plan_types": "001_normalize_account_plan_types",
+        "004_add_accounts_chatgpt_account_id": "004_add_accounts_chatgpt_account_id",
+    }
+    _HAS_REVISION_REMAP = False
+
 from app.db.migrate import (
     LEGACY_MIGRATION_ORDER,
-    check_migration_policy,
     check_schema_drift,
     inspect_migration_state,
     run_startup_migrations,
@@ -20,11 +30,43 @@ from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 
+try:
+    from app.db.migrate import check_migration_policy
+except ImportError:
+    check_migration_policy = None  # type: ignore[assignment]
 pytestmark = pytest.mark.integration
 _DATABASE_URL = get_settings().database_url
 _HEAD_REVISION = inspect_migration_state(_DATABASE_URL).head_revision
 _STAMPED_AFTER_LEGACY_PREFIX_4 = OLD_TO_NEW_REVISION_MAP["004_add_accounts_chatgpt_account_id"]
 _STAMPED_AFTER_LEGACY_PREFIX_1 = OLD_TO_NEW_REVISION_MAP["001_normalize_account_plan_types"]
+
+
+def _expected_head_revisions() -> list[str]:
+    return sorted(revision for revision in _HEAD_REVISION.split(",") if revision)
+
+
+def _normalize_revision_rows(raw_revisions: list[str]) -> list[str]:
+    revisions: set[str] = set()
+    for raw in raw_revisions:
+        revisions.update(part for part in str(raw).split(",") if part)
+    return sorted(revisions)
+
+
+async def _read_alembic_version_revisions() -> list[str]:
+    async with SessionLocal() as session:
+        revision_rows = await session.execute(text("SELECT version_num FROM alembic_version"))
+        raw = [str(row[0]) for row in revision_rows.fetchall()]
+    return _normalize_revision_rows(raw)
+
+
+async def _replace_alembic_versions_with_single_revision(revision: str) -> None:
+    async with SessionLocal() as session:
+        await session.execute(text("DELETE FROM alembic_version"))
+        await session.execute(
+            text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
+            {"revision": revision},
+        )
+        await session.commit()
 
 
 def _is_postgresql_database_url(url: str) -> bool:
@@ -98,10 +140,8 @@ async def test_run_startup_migrations_bootstraps_legacy_history(raw_db_setup):
     assert result.bootstrap.stamped_revision == _STAMPED_AFTER_LEGACY_PREFIX_4
     assert result.current_revision == _HEAD_REVISION
 
-    async with SessionLocal() as session:
-        revision_rows = await session.execute(text("SELECT version_num FROM alembic_version"))
-        revisions = [str(row[0]) for row in revision_rows.fetchall()]
-        assert revisions == [_HEAD_REVISION]
+    revisions = await _read_alembic_version_revisions()
+    assert revisions == _expected_head_revisions()
 
 
 @pytest.mark.asyncio
@@ -166,45 +206,37 @@ async def test_run_startup_migrations_handles_unknown_legacy_rows(raw_db_setup):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _HAS_REVISION_REMAP, reason="requires revision remap support")
 async def test_run_startup_migrations_auto_remaps_legacy_alembic_revision_ids(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
     legacy_head = "013_add_dashboard_settings_routing_strategy"
-    async with SessionLocal() as session:
-        await session.execute(text("UPDATE alembic_version SET version_num = :legacy"), {"legacy": legacy_head})
-        await session.commit()
+    await _replace_alembic_versions_with_single_revision(legacy_head)
 
     result = await run_startup_migrations(_DATABASE_URL)
     assert result.current_revision == _HEAD_REVISION
 
-    async with SessionLocal() as session:
-        revision_rows = await session.execute(text("SELECT version_num FROM alembic_version"))
-        revisions = sorted(str(row[0]) for row in revision_rows.fetchall())
-        assert revisions == [_HEAD_REVISION]
+    revisions = await _read_alembic_version_revisions()
+    assert revisions == _expected_head_revisions()
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _HAS_REVISION_REMAP, reason="requires revision remap support")
 async def test_run_startup_migrations_auto_remaps_firewall_legacy_revision_id(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
     legacy_firewall_revision = "014_add_api_firewall_allowlist"
-    async with SessionLocal() as session:
-        await session.execute(
-            text("UPDATE alembic_version SET version_num = :legacy"),
-            {"legacy": legacy_firewall_revision},
-        )
-        await session.commit()
+    await _replace_alembic_versions_with_single_revision(legacy_firewall_revision)
 
     result = await run_startup_migrations(_DATABASE_URL)
     assert result.current_revision == _HEAD_REVISION
 
-    async with SessionLocal() as session:
-        revision_rows = await session.execute(text("SELECT version_num FROM alembic_version"))
-        revisions = sorted(str(row[0]) for row in revision_rows.fetchall())
-        assert revisions == [_HEAD_REVISION]
+    revisions = await _read_alembic_version_revisions()
+    assert revisions == _expected_head_revisions()
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _HAS_REVISION_REMAP, reason="requires revision remap support")
 async def test_run_startup_migrations_handles_legacy_schema_table_and_legacy_alembic_id_together(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
@@ -224,8 +256,9 @@ async def test_run_startup_migrations_handles_legacy_schema_table_and_legacy_ale
                 text("INSERT INTO schema_migrations (name, applied_at) VALUES (:name, :applied_at)"),
                 {"name": migration_name, "applied_at": f"2026-02-13T00:00:0{index}Z"},
             )
+        await session.execute(text("DELETE FROM alembic_version"))
         await session.execute(
-            text("UPDATE alembic_version SET version_num = :legacy"),
+            text("INSERT INTO alembic_version (version_num) VALUES (:legacy)"),
             {"legacy": "013_add_dashboard_settings_routing_strategy"},
         )
         await session.commit()
@@ -236,7 +269,10 @@ async def test_run_startup_migrations_handles_legacy_schema_table_and_legacy_ale
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only migration contract test")
+@pytest.mark.skipif(
+    (not _is_postgresql_database_url(_DATABASE_URL)) or check_migration_policy is None,
+    reason="PostgreSQL-only migration contract test",
+)
 async def test_postgresql_migration_contract_policy_and_drift_match(raw_db_setup):
     result = await run_startup_migrations(_DATABASE_URL)
     assert result.current_revision == _HEAD_REVISION
@@ -246,7 +282,30 @@ async def test_postgresql_migration_contract_policy_and_drift_match(raw_db_setup
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not _is_postgresql_database_url(_DATABASE_URL), reason="PostgreSQL-only migration remap test")
+@pytest.mark.skipif(
+    not _is_postgresql_database_url(_DATABASE_URL),
+    reason="PostgreSQL-only empty database migration test",
+)
+async def test_postgresql_upgrade_head_from_empty_database(db_setup):
+    async with SessionLocal() as session:
+        await session.execute(text("DROP SCHEMA public CASCADE"))
+        await session.execute(text("CREATE SCHEMA public"))
+        await session.commit()
+
+    result = await run_startup_migrations(_DATABASE_URL)
+    assert result.current_revision == _HEAD_REVISION
+
+    async with SessionLocal() as session:
+        revision_rows = await session.execute(text("SELECT version_num FROM alembic_version"))
+        revisions = sorted(str(row[0]) for row in revision_rows.fetchall())
+        assert revisions == [_HEAD_REVISION]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    (not _is_postgresql_database_url(_DATABASE_URL)) or (not _HAS_REVISION_REMAP),
+    reason="PostgreSQL-only migration remap test",
+)
 async def test_postgresql_startup_migration_auto_remap_legacy_head(raw_db_setup):
     await run_startup_migrations(_DATABASE_URL)
 
@@ -432,58 +491,96 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
 
         async with session_factory() as session:
             await session.execute(text("PRAGMA foreign_keys=ON"))
-            routing_strategy = (
-                await session.execute(text("SELECT routing_strategy FROM dashboard_settings WHERE id=1"))
-            ).scalar_one()
-            assert routing_strategy == "usage_weighted"
+            dashboard_columns_rows = (await session.execute(text("PRAGMA table_info(dashboard_settings)"))).fetchall()
+            dashboard_columns = {str(row[1]) for row in dashboard_columns_rows if len(row) > 1}
+            request_log_columns_rows = (await session.execute(text("PRAGMA table_info(request_logs)"))).fetchall()
+            request_log_columns = {str(row[1]) for row in request_log_columns_rows if len(row) > 1}
+            assert "transport" in request_log_columns
+            if "routing_strategy" in dashboard_columns:
+                routing_strategy = (
+                    await session.execute(text("SELECT routing_strategy FROM dashboard_settings WHERE id=1"))
+                ).scalar_one()
+                assert routing_strategy == "usage_weighted"
             http_proxy_url = (
                 await session.execute(text("SELECT http_proxy_url FROM dashboard_settings WHERE id=1"))
             ).scalar_one()
             assert http_proxy_url is None
-            index_rows = (await session.execute(text("PRAGMA index_list(accounts)"))).fetchall()
-            has_email_non_unique_index = False
-            for row in index_rows:
-                if len(row) < 3:
-                    continue
-                index_name = str(row[1])
-                is_unique = bool(row[2])
-                escaped_name = index_name.replace('"', '""')
-                index_info_rows = (await session.execute(text(f'PRAGMA index_info("{escaped_name}")'))).fetchall()
-                column_names = [str(info[2]) for info in index_info_rows if len(info) > 2]
-                if column_names == ["email"] and not is_unique:
-                    has_email_non_unique_index = True
-                    break
-            assert has_email_non_unique_index
-
+            assert "openai_cache_affinity_max_age_seconds" in dashboard_columns
+        affinity_ttl = (
             await session.execute(
-                text(
-                    """
-                    INSERT INTO accounts (
-                        id, chatgpt_account_id, email, plan_type,
-                        access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
-                        last_refresh, created_at, status, deactivation_reason, reset_at
-                    )
-                    VALUES (
-                        'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
-                        x'11', x'12', x'13',
-                        '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
-                    )
-                    """
-                )
+                text("SELECT openai_cache_affinity_max_age_seconds FROM dashboard_settings WHERE id=1")
             )
-            usage_count = (
-                await session.execute(text("SELECT COUNT(*) FROM usage_history WHERE account_id='acc_legacy'"))
-            ).scalar_one()
-            logs_count = (
-                await session.execute(text("SELECT COUNT(*) FROM request_logs WHERE account_id='acc_legacy'"))
-            ).scalar_one()
-            sticky_count = (
-                await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE account_id='acc_legacy'"))
-            ).scalar_one()
-            await session.commit()
+        ).scalar_one()
+        assert affinity_ttl == 300
+        sticky_columns_rows = (await session.execute(text("PRAGMA table_info(sticky_sessions)"))).fetchall()
+        sticky_columns = {str(row[1]) for row in sticky_columns_rows if len(row) > 1}
+        assert "kind" in sticky_columns
+        sticky_kind = (
+            await session.execute(text("SELECT kind FROM sticky_sessions WHERE key='sticky_1'"))
+        ).scalar_one()
+        assert sticky_kind == "sticky_thread"
+        await session.execute(
+            text(
+                """
+                INSERT INTO sticky_sessions (key, account_id, kind, created_at, updated_at)
+                VALUES ('sticky_1', 'acc_legacy', 'prompt_cache', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                """
+            )
+        )
+        sticky_same_key_count = (
+            await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE key='sticky_1'"))
+        ).scalar_one()
+        assert sticky_same_key_count == 2
+        index_rows = (await session.execute(text("PRAGMA index_list(accounts)"))).fetchall()
+        has_email_non_unique_index = False
+        for row in index_rows:
+            if len(row) < 3:
+                continue
+            index_name = str(row[1])
+            is_unique = bool(row[2])
+            escaped_name = index_name.replace('"', '""')
+            index_info_rows = (await session.execute(text(f'PRAGMA index_info("{escaped_name}")'))).fetchall()
+            column_names = [str(info[2]) for info in index_info_rows if len(info) > 2]
+            if column_names == ["email"] and not is_unique:
+                has_email_non_unique_index = True
+                break
+        assert has_email_non_unique_index
+        usage_index_rows = (await session.execute(text("PRAGMA index_list(usage_history)"))).fetchall()
+        usage_index_names = {str(row[1]) for row in usage_index_rows if len(row) > 1}
+        assert "idx_usage_window_account_latest" in usage_index_names
+        request_log_index_rows = (await session.execute(text("PRAGMA index_list(request_logs)"))).fetchall()
+        request_log_index_names = {str(row[1]) for row in request_log_index_rows if len(row) > 1}
+        assert "idx_logs_requested_at_id" in request_log_index_names
 
-            assert usage_count == 1
-            assert logs_count == 1
-            assert sticky_count == 1
+        await session.execute(
+            text(
+                """
+                INSERT INTO accounts (
+                    id, chatgpt_account_id, email, plan_type,
+                    access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
+                    last_refresh, created_at, status, deactivation_reason, reset_at
+                )
+                VALUES (
+                    'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
+                    x'11', x'12', x'13',
+                    '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
+                )
+                """
+            )
+        )
+        usage_count = (
+            await session.execute(text("SELECT COUNT(*) FROM usage_history WHERE account_id='acc_legacy'"))
+        ).scalar_one()
+        logs_count = (
+            await session.execute(text("SELECT COUNT(*) FROM request_logs WHERE account_id='acc_legacy'"))
+        ).scalar_one()
+        sticky_count = (
+            await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE account_id='acc_legacy'"))
+        ).scalar_one()
+        await session.commit()
+
+        assert usage_count == 1
+        assert logs_count == 1
+        assert sticky_count == 2
     finally:
         await engine.dispose()

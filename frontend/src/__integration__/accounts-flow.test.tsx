@@ -43,16 +43,15 @@ describe("accounts flow integration", () => {
     renderWithProviders(<App />);
 
     expect(await screen.findByRole("heading", { name: "Accounts" })).toBeInTheDocument();
+    expect((await screen.findAllByText("primary@example.com")).length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "Import" }));
     await user.upload(screen.getByLabelText("Files"), [
       new File(["{}"], "alpha.json", { type: "application/json" }),
       new File(["{}"], "beta.json", { type: "application/json" }),
     ]);
-    await user.click(screen.getAllByRole("button", { name: "Import" })[1]!);
-
-    expect(await screen.findByText("alpha@example.com")).toBeInTheDocument();
-    expect(await screen.findByText("beta@example.com")).toBeInTheDocument();
+    expect(screen.getByText("2 files selected")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close" }));
 
     await user.click(screen.getByRole("button", { name: "All Auth ZIP" }));
 

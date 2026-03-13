@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import cast
 
 import pytest
 
@@ -9,7 +10,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.modules.accounts import auth_manager as auth_manager_module
-from app.modules.accounts.auth_manager import AuthManager
+from app.modules.accounts.auth_manager import AccountsRepositoryPort, AuthManager
 
 pytestmark = pytest.mark.unit
 
@@ -17,6 +18,7 @@ pytestmark = pytest.mark.unit
 class _DummyRepo:
     def __init__(self) -> None:
         self.tokens_payload: dict[str, object] | None = None
+        self.status_payload: dict[str, object] | None = None
 
     async def update_status(
         self,
@@ -24,6 +26,11 @@ class _DummyRepo:
         status: AccountStatus,
         deactivation_reason: str | None = None,
     ) -> bool:
+        self.status_payload = {
+            "account_id": account_id,
+            "status": status,
+            "deactivation_reason": deactivation_reason,
+        }
         return True
 
     async def update_tokens(
@@ -77,10 +84,46 @@ async def test_refresh_account_preserves_plan_type_when_missing(monkeypatch):
         deactivation_reason=None,
     )
     repo = _DummyRepo()
-    manager = AuthManager(repo)
+    manager = AuthManager(cast(AccountsRepositoryPort, repo))
 
     updated = await manager.refresh_account(account)
 
     assert updated.plan_type == "pro"
     assert repo.tokens_payload is not None
     assert repo.tokens_payload["plan_type"] == "pro"
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_deactivates_on_permanent_refresh_error(monkeypatch):
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        raise auth_manager_module.RefreshError(
+            code="invalid_grant",
+            message="Your refresh token has already been used to generate a new access token. Please try signing in again.",
+            is_permanent=True,
+        )
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_perm",
+        email="user@example.com",
+        plan_type="pro",
+        access_token_encrypted=encryptor.encrypt("access-old"),
+        refresh_token_encrypted=encryptor.encrypt("refresh-old"),
+        id_token_encrypted=encryptor.encrypt("id-old"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(repo)
+
+    with pytest.raises(auth_manager_module.RefreshError):
+        await manager.refresh_account(account)
+
+    assert account.status == AccountStatus.DEACTIVATED
+    assert repo.status_payload is not None
+    assert repo.status_payload["account_id"] == "acc_perm"
+    assert repo.status_payload["status"] == AccountStatus.DEACTIVATED
+    assert account.deactivation_reason == "Refresh token was reused - re-login required"

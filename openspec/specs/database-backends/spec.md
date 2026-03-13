@@ -20,6 +20,28 @@ The service MUST accept a PostgreSQL SQLAlchemy async DSN (`postgresql+asyncpg:/
 - **WHEN** `CODEX_LB_DATABASE_URL` is set to `postgresql+asyncpg://...`
 - **THEN** service startup uses PostgreSQL for ORM operations and migration execution
 
+### Requirement: SQLite startup validation mode is configurable
+The service MUST support configurable startup validation for SQLite file databases via `CODEX_LB_DATABASE_SQLITE_STARTUP_CHECK_MODE`.
+
+#### Scenario: Default SQLite startup uses quick validation
+- **GIVEN** the configured database URL is a SQLite file
+- **AND** `CODEX_LB_DATABASE_SQLITE_STARTUP_CHECK_MODE` is unset
+- **WHEN** the service starts
+- **THEN** it runs `PRAGMA quick_check`
+- **AND** it does not run `PRAGMA integrity_check`
+
+#### Scenario: Full SQLite startup validation is explicitly enabled
+- **GIVEN** the configured database URL is a SQLite file
+- **AND** `CODEX_LB_DATABASE_SQLITE_STARTUP_CHECK_MODE=full`
+- **WHEN** the service starts
+- **THEN** it runs `PRAGMA integrity_check`
+
+#### Scenario: SQLite startup validation can be skipped
+- **GIVEN** the configured database URL is a SQLite file
+- **AND** `CODEX_LB_DATABASE_SQLITE_STARTUP_CHECK_MODE=off`
+- **WHEN** the service starts
+- **THEN** it skips startup SQLite validation
+
 ### Requirement: Test suite supports backend selection
 The test bootstrap MUST allow callers to override `CODEX_LB_DATABASE_URL` via environment and MUST default to SQLite when no override is provided.
 
@@ -37,3 +59,10 @@ CI MUST keep SQLite-backed tests as the default path and MUST run an additional 
 #### Scenario: CI workflow execution
 - **WHEN** CI runs on push or pull request
 - **THEN** at least one pytest job runs with SQLite and another pytest job runs with PostgreSQL
+
+### Requirement: ORM enums persist schema string values
+ORM enum columns backed by named PostgreSQL enums MUST persist the lowercase string values defined by the schema and migrations, not Python enum member names.
+
+#### Scenario: SQLAlchemy binds account and API key enums
+- **WHEN** the ORM metadata is built for `Account.status`, `ApiKeyLimit.limit_type`, and `ApiKeyLimit.limit_window`
+- **THEN** each SQLAlchemy enum type exposes the same lowercase string values used by migrations and persisted rows

@@ -43,6 +43,8 @@ Load balancer for ChatGPT accounts. Pool multiple accounts, track usage, manage 
 </tr>
 </table>
 
+- Accounts UI supports batch `auth.json` import and one-click auth archive export.
+
 ## Quick Start
 
 ```bash
@@ -85,7 +87,33 @@ model_provider = "codex-lb"
 name = "OpenAI"  # required — enables remote /responses/compact
 base_url = "http://127.0.0.1:2455/backend-api/codex"
 wire_api = "responses"
+supports_websockets = true
 ```
+
+Optional: enable native upstream WebSockets for Codex streaming while keeping `codex-lb` pooling:
+
+```bash
+export CODEX_LB_UPSTREAM_STREAM_TRANSPORT=websocket
+```
+
+`auto` is the default and uses native WebSockets for native Codex headers or models that prefer them.
+You can also switch this in the dashboard under Settings -> Routing -> Upstream stream transport.
+
+Note: Codex itself does not currently expose a stable documented `wire_api = "websocket"` provider mode.
+If you want to experiment on the Codex side, the current CLI exposes under-development feature flags:
+
+```toml
+[features]
+responses_websockets = true
+# or
+responses_websockets_v2 = true
+```
+
+These flags are experimental and do not replace `wire_api = "responses"`.
+
+If upstream websocket handshakes must use environment proxies in your deployment, set
+`CODEX_LB_UPSTREAM_WEBSOCKET_TRUST_ENV=true`. By default websocket handshakes connect directly to
+match Codex CLI's native transport.
 
 **With [API key auth](#api-key-authentication):**
 
@@ -95,12 +123,29 @@ name = "OpenAI"
 base_url = "http://127.0.0.1:2455/backend-api/codex"
 wire_api = "responses"
 env_key = "CODEX_LB_API_KEY"
+supports_websockets = true
 ```
 
 ```bash
 export CODEX_LB_API_KEY="sk-clb-..."   # key from dashboard
 codex
 ```
+
+**Verify WebSocket transport**
+
+Use a one-off debug run:
+
+```bash
+RUST_LOG=debug codex exec "Reply with OK only."
+```
+
+Healthy websocket signals:
+
+- CLI logs contain `connecting to websocket` and `successfully connected to websocket`
+- `codex-lb` logs show `WebSocket /backend-api/codex/responses`
+- `codex-lb` logs do **not** show fallback `POST /backend-api/codex/responses` for the same run
+
+If you run `codex-lb` behind a reverse proxy, make sure it forwards WebSocket upgrades.
 
 **Migrating from direct OpenAI** — `codex resume` filters by `model_provider`;
 old sessions won't appear until you re-tag them:
@@ -121,52 +166,52 @@ sqlite3 ~/.codex/state_5.sqlite \
 <summary><img src="https://avatars.githubusercontent.com/u/208539476?s=200" width="20" align="center" alt="OpenCode">&ensp;<b>OpenCode</b></summary>
 <br>
 
+> **Important**: Use the built-in `openai` provider with `baseURL` override — not a custom provider with `@ai-sdk/openai-compatible`. Custom providers use the Chat Completions API which **drops reasoning/thinking content**. The built-in `openai` provider uses the Responses API, which properly preserves `encrypted_content` and multi-turn reasoning state.
+
 `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "codex-lb": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "codex-lb",
-      "options": {
-        "baseURL": "http://127.0.0.1:2455/v1"
-      },
-      "models": {
-        "gpt-5.3-codex": { "name": "GPT-5.3 Codex", "reasoning": true, "interleaved": { "field": "reasoning_details" },"options": { "reasoningEffort": "medium"} }
-      }
-    }
-  },
-  "model": "codex-lb/gpt-5.3-codex"
-}
-```
-
-This keeps OpenCode's default providers/connections available and adds `codex-lb` as an extra selectable provider.
-
-If you use `enabled_providers`, include every provider you want to keep plus `codex-lb`; otherwise non-listed providers are hidden.
-
-**With API key auth:**
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "codex-lb": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "codex-lb",
+    "openai": {
       "options": {
         "baseURL": "http://127.0.0.1:2455/v1",
-        "apiKey": "{env:CODEX_LB_API_KEY}"   // reads from env var
+        "apiKey": "{env:CODEX_LB_API_KEY}"
       },
       "models": {
-        "gpt-5.3-codex": { "name": "GPT-5.3 Codex", "reasoning": true, "interleaved": { "field": "reasoning_details" },"options": { "reasoningEffort": "medium"} }
+        "gpt-5.4": {
+          "name": "GPT-5.4",
+          "reasoning": true,
+          "options": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+          "limit": { "context": 1050000, "output": 128000 }
+        },
+        "gpt-5.3-codex": {
+          "name": "GPT-5.3 Codex",
+          "reasoning": true,
+          "options": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+          "limit": { "context": 272000, "output": 65536 }
+        },
+        "gpt-5.1-codex-mini": {
+          "name": "GPT-5.1 Codex Mini",
+          "reasoning": true,
+          "options": { "reasoningEffort": "high", "reasoningSummary": "detailed" },
+          "limit": { "context": 272000, "output": 65536 }
+        },
+        "gpt-5.3-codex-spark": {
+          "name": "GPT-5.3 Codex Spark",
+          "reasoning": true,
+          "options": { "reasoningEffort": "xhigh", "reasoningSummary": "detailed" },
+          "limit": { "context": 128000, "output": 65536 }
+        }
       }
     }
   },
-  "model": "codex-lb/gpt-5.3-codex"
+  "model": "openai/gpt-5.3-codex"
 }
 ```
+
+This overrides the built-in `openai` provider's endpoint to point at codex-lb while keeping the Responses API code path that handles reasoning properly.
 
 ```bash
 export CODEX_LB_API_KEY="sk-clb-..."   # key from dashboard
@@ -240,6 +285,8 @@ When enabled, clients must pass a valid API key as a Bearer token:
 Authorization: Bearer sk-clb-...
 ```
 
+Optional extra hardening: enable `CODEX_LB_PROXY_KEY_AUTH_ENABLED=true` with `CODEX_LB_PROXY_KEY` to require `X-Codex-Proxy-Key` on proxy requests in addition to Bearer auth.
+
 **Creating keys**: Dashboard → API Keys → Create. The full key is shown **only once** at creation. Keys support optional expiration, model restrictions, and rate limits (tokens / cost per day / week / month).
 
 ## Configuration
@@ -247,6 +294,7 @@ Authorization: Bearer sk-clb-...
 Environment variables with `CODEX_LB_` prefix or `.env.local`. See [`.env.example`](.env.example).
 Dashboard auth is configured in Settings.
 SQLite is the default database backend; PostgreSQL is optional via `CODEX_LB_DATABASE_URL` (for example `postgresql+asyncpg://...`).
+Container startup also honors `PORT` and auto-loads `/app/.env` when that file is mounted.
 
 ## Data
 
@@ -292,6 +340,15 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/DOCaCola"><img src="https://avatars.githubusercontent.com/u/2077396?v=4?s=100" width="100px;" alt="DOCaCola"/><br /><sub><b>DOCaCola</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/issues?q=author%3ADOCaCola" title="Bug reports">🐛</a> <a href="https://github.com/Soju06/codex-lb/commits?author=DOCaCola" title="Tests">⚠️</a> <a href="https://github.com/Soju06/codex-lb/commits?author=DOCaCola" title="Documentation">📖</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/joeblack2k"><img src="https://avatars.githubusercontent.com/u/3456102?v=4?s=100" width="100px;" alt="JoeBlack2k"/><br /><sub><b>JoeBlack2k</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=joeblack2k" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/issues?q=author%3Ajoeblack2k" title="Bug reports">🐛</a> <a href="https://github.com/Soju06/codex-lb/commits?author=joeblack2k" title="Tests">⚠️</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/ink-splatters"><img src="https://avatars.githubusercontent.com/u/2706884?v=4?s=100" width="100px;" alt="Peter A."/><br /><sub><b>Peter A.</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=ink-splatters" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/xCatalitY"><img src="https://avatars.githubusercontent.com/u/74815681?v=4?s=100" width="100px;" alt="Hannah Markfort"/><br /><sub><b>Hannah Markfort</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=xCatalitY" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=xCatalitY" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mws-weekend-projects"><img src="https://avatars.githubusercontent.com/u/255546191?v=4?s=100" width="100px;" alt="mws-weekend-projects"/><br /><sub><b>mws-weekend-projects</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=mws-weekend-projects" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=mws-weekend-projects" title="Tests">⚠️</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="http://hextra.us"><img src="https://avatars.githubusercontent.com/u/88663250?v=4?s=100" width="100px;" alt="Quang Do"/><br /><sub><b>Quang Do</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=quangdo126" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=quangdo126" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/aaiyer"><img src="https://avatars.githubusercontent.com/u/426027?v=4?s=100" width="100px;" alt="Anand Aiyer"/><br /><sub><b>Anand Aiyer</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/issues?q=author%3Aaaiyer" title="Bug reports">🐛</a> <a href="https://github.com/Soju06/codex-lb/commits?author=aaiyer" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=aaiyer" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/defin85"><img src="https://avatars.githubusercontent.com/u/31535407?v=4?s=100" width="100px;" alt="defin85"/><br /><sub><b>defin85</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=defin85" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/issues?q=author%3Adefin85" title="Bug reports">🐛</a> <a href="https://github.com/Soju06/codex-lb/commits?author=defin85" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://linktree.huzky.dev/"><img src="https://avatars.githubusercontent.com/u/194083329?v=4?s=100" width="100px;" alt="Jacky Fong"/><br /><sub><b>Jacky Fong</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=huzky-v" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/flokosti96"><img src="https://avatars.githubusercontent.com/u/144428350?v=4?s=100" width="100px;" alt="flokosti96"/><br /><sub><b>flokosti96</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=flokosti96" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=flokosti96" title="Tests">⚠️</a></td>
     </tr>
   </tbody>
 </table>
