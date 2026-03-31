@@ -69,6 +69,8 @@ async def lifespan(_: FastAPI):
     logger.debug("Starting usage_scheduler DONE")
     logger.debug("Starting model_scheduler")
     await model_scheduler.start()
+    logger.info("Application startup complete")
+    await sticky_session_cleanup_scheduler.start()
     logger.debug("Starting model_scheduler DONE ")
     logger.info("Application startup complete")
     logger.debug("Starting cleanup_scheduler")
