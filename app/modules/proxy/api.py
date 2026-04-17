@@ -13,7 +13,15 @@ from app.core.auth.dependencies import (
     set_openai_error_format,
     validate_codex_usage_identity,
     validate_proxy_api_key,
+    validate_proxy_api_key_anthropic,
     validate_proxy_api_key_authorization,
+)
+from app.core.anthropic import (
+    AnthropicCountTokensResponse,
+    AnthropicMessagesRequest,
+    anthropic_message_from_chat_completion,
+    approximate_anthropic_input_tokens,
+    stream_anthropic_messages,
 )
 from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import get_settings
@@ -81,6 +89,11 @@ v1_router = APIRouter(
     prefix="/v1",
     tags=["proxy"],
     dependencies=[Security(validate_proxy_api_key), Depends(set_openai_error_format)],
+)
+anthropic_v1_router = APIRouter(
+    prefix="/v1",
+    tags=["proxy"],
+    dependencies=[Depends(set_openai_error_format)],
 )
 v1_ws_router = APIRouter(
     prefix="/v1",
@@ -403,6 +416,134 @@ async def v1_chat_completions(
     )
 
 
+@anthropic_v1_router.post("/messages")
+async def v1_anthropic_messages(
+    request: Request,
+    payload: AnthropicMessagesRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Depends(validate_proxy_api_key_anthropic),
+) -> Response:
+    try:
+        chat_payload = payload.to_chat_completions_request()
+    except (ClientPayloadError, ValidationError, ValueError) as exc:
+        return _anthropic_logged_error_json_response(
+            request,
+            400,
+            "invalid_request_error",
+            str(exc),
+        )
+
+    effective_model = _effective_model_for_api_key(api_key, chat_payload.model)
+    validate_model_access(api_key, effective_model)
+    chat_payload.model = effective_model
+
+    rate_limit_headers = await context.service.rate_limit_headers()
+    try:
+        responses_payload = chat_payload.to_responses_request()
+    except ClientPayloadError as exc:
+        return _anthropic_logged_error_json_response(
+            request,
+            400,
+            "invalid_request_error",
+            f"Invalid payload parameter: {exc.param}",
+            headers=rate_limit_headers,
+        )
+    except (ValidationError, ValueError) as exc:
+        return _anthropic_logged_error_json_response(
+            request,
+            400,
+            "invalid_request_error",
+            str(exc),
+            headers=rate_limit_headers,
+        )
+
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=effective_model,
+        request_service_tier=responses_payload.service_tier,
+    )
+    responses_payload.stream = True
+    apply_api_key_enforcement(responses_payload, api_key)
+    stream = context.service.stream_responses(
+        responses_payload,
+        request.headers,
+        propagate_http_errors=True,
+        openai_cache_affinity=True,
+        api_key=api_key,
+        api_key_reservation=reservation,
+        suppress_text_done_events=False,
+    )
+    try:
+        first = await stream.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except ProxyResponseError as exc:
+        error_payload = _parse_openai_error_for_anthropic(exc.payload)
+        return _anthropic_logged_error_json_response(
+            request,
+            exc.status_code,
+            error_payload["type"],
+            error_payload["message"],
+            headers=rate_limit_headers,
+        )
+
+    stream_with_first = _prepend_first(first, stream)
+    if payload.stream:
+        return StreamingResponse(
+            stream_anthropic_messages(stream_with_first, model=responses_payload.model),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+                **rate_limit_headers,
+            },
+        )
+
+    result = await collect_chat_completion(stream_with_first, model=responses_payload.model)
+    if isinstance(result, OpenAIErrorEnvelopeModel):
+        error_payload = _parse_openai_error_for_anthropic(result.model_dump(mode="json", exclude_none=True))
+        return _anthropic_logged_error_json_response(
+            request,
+            502,
+            error_payload["type"],
+            error_payload["message"],
+            headers=rate_limit_headers,
+        )
+    anthropic_response = anthropic_message_from_chat_completion(result)
+    return JSONResponse(
+        content=anthropic_response,
+        status_code=200,
+        headers={
+            "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+            **rate_limit_headers,
+        },
+    )
+
+
+@anthropic_v1_router.post("/messages/count_tokens", response_model=AnthropicCountTokensResponse)
+async def v1_anthropic_count_tokens(
+    request: Request,
+    payload: AnthropicMessagesRequest = Body(...),
+    _: ApiKeyData | None = Depends(validate_proxy_api_key_anthropic),
+) -> Response:
+    try:
+        response_payload = AnthropicCountTokensResponse(
+            input_tokens=approximate_anthropic_input_tokens(payload)
+        )
+    except (ValidationError, ValueError) as exc:
+        return _anthropic_logged_error_json_response(
+            request,
+            400,
+            "invalid_request_error",
+            str(exc),
+        )
+    return JSONResponse(
+        content=response_payload.model_dump(mode="json"),
+        status_code=200,
+        headers={"anthropic-version": request.headers.get("anthropic-version", "2023-06-01")},
+    )
+
+
 async def _stream_responses(
     request: Request,
     payload: ResponsesRequest,
@@ -682,6 +823,35 @@ def _logged_error_json_response(
     return JSONResponse(status_code=status_code, content=content, headers=headers)
 
 
+def _anthropic_logged_error_json_response(
+    request: Request,
+    status_code: int,
+    error_type: str,
+    message: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
+    content = {
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        },
+    }
+    log_error_response(
+        logger,
+        request,
+        status_code,
+        error_type,
+        message,
+        category="proxy_error_response",
+    )
+    response_headers = {"anthropic-version": request.headers.get("anthropic-version", "2023-06-01")}
+    if headers:
+        response_headers.update(headers)
+    return JSONResponse(status_code=status_code, content=content, headers=response_headers)
+
+
 def _error_details_from_content(
     content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
 ) -> tuple[str | None, str | None]:
@@ -699,6 +869,23 @@ def _error_details_from_content(
     code = error_mapping.get("code")
     message = error_mapping.get("message")
     return code if isinstance(code, str) else None, message if isinstance(message, str) else None
+
+
+def _parse_openai_error_for_anthropic(
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+) -> dict[str, str]:
+    code, message = _error_details_from_content(content)
+    mapped_type = "api_error"
+    if code in {"invalid_api_key", "invalid_request_error", "invalid_payload"}:
+        mapped_type = "invalid_request_error"
+    elif code in {"rate_limit_exceeded", "usage_limit_reached", "quota_exceeded"}:
+        mapped_type = "rate_limit_error"
+    elif code in {"authentication_error", "unauthorized"}:
+        mapped_type = "authentication_error"
+    return {
+        "type": mapped_type,
+        "message": message or "Proxy request failed",
+    }
 
 
 async def _validate_proxy_websocket_request(

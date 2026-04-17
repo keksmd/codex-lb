@@ -107,6 +107,7 @@ def create_app() -> FastAPI:
     app.include_router(proxy_api.router)
     app.include_router(proxy_api.ws_router)
     app.include_router(proxy_api.v1_router)
+    app.include_router(proxy_api.anthropic_v1_router)
     app.include_router(proxy_api.v1_ws_router)
     app.include_router(proxy_api.transcribe_router)
     app.include_router(proxy_api.usage_router)

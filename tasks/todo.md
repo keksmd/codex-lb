@@ -148,3 +148,18 @@
 ## Review (Bugfix: Startup Migration Crash)
 - [x] Confirm startup no longer fails at migration stage.
 - [x] Confirm migration history/state remains consistent after the fix.
+
+## Anthropic Messages Adapter For Claude
+- [x] Confirm Claude-style provider wiring still expects an Anthropic-compatible `/v1/messages` backend even when `base_url` is configurable.
+- [x] Reuse `codex-lb`'s existing `/v1/chat/completions` and `/v1/responses` pipeline instead of adding a second upstream transport stack.
+- [x] Add Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens` endpoints to `codex-lb`.
+- [x] Accept Anthropic `x-api-key` authentication on the Anthropic routes without changing existing Bearer semantics for OpenAI routes.
+- [x] Add targeted unit/integration coverage for Anthropic request mapping, streaming, and `x-api-key` auth.
+- [x] Verify targeted tests pass in the project environment.
+
+## Review (Anthropic Messages Adapter For Claude)
+- [x] Confirm `/v1/messages` maps Anthropic text/tool blocks onto the existing Chat/Responses proxy path instead of bypassing the load balancer.
+- [x] Confirm streaming returns Anthropic SSE events (`message_start`, `content_block_*`, `message_delta`, `message_stop`).
+- [x] Confirm `/v1/messages/count_tokens` returns a stable approximate token count for Claude-side preflight/token estimation.
+- [x] Confirm when API key auth is enabled, Anthropic clients can authenticate with `x-api-key`.
+- [x] Confirm a real Claude CLI run can target local `codex-lb` through `~/.claude/settings.json` and complete a prompt via `POST /v1/messages`.

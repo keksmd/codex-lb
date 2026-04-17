@@ -44,6 +44,25 @@ async def validate_proxy_api_key(
     return await validate_proxy_api_key_authorization(authorization)
 
 
+async def validate_proxy_api_key_anthropic(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+) -> ApiKeyData | None:
+    _validate_optional_proxy_key_header(request)
+    settings = await get_settings_cache().get()
+    if not settings.api_key_auth_enabled:
+        return None
+
+    authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    token = _extract_bearer_token(authorization)
+    if token is None:
+        token = _extract_header_token(request.headers.get("x-api-key"))
+    if token is None:
+        raise ProxyAuthError("Missing API key in Authorization or x-api-key header")
+
+    return await _validate_proxy_api_key_token(token)
+
+
 async def validate_proxy_api_key_authorization(authorization: str | None) -> ApiKeyData | None:
     settings = await get_settings_cache().get()
     if not settings.api_key_auth_enabled:
@@ -53,12 +72,17 @@ async def validate_proxy_api_key_authorization(authorization: str | None) -> Api
     if not token:
         raise ProxyAuthError("Missing API key in Authorization header")
 
+    return await _validate_proxy_api_key_token(token)
+
+
+async def _validate_proxy_api_key_token(token: str) -> ApiKeyData | None:
     async with get_background_session() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         try:
             return await service.validate_key(token)
         except ApiKeyInvalidError as exc:
             raise ProxyAuthError(str(exc)) from exc
+
 
 
 # --- Dashboard session auth ---
@@ -125,6 +149,15 @@ def _extract_bearer_token(authorization: str | None) -> str | None:
     if not value.lower().startswith(prefix):
         return None
     token = value[len(prefix) :].strip()
+    if not token:
+        return None
+    return token
+
+
+def _extract_header_token(value: str | None) -> str | None:
+    if value is None:
+        return None
+    token = value.strip()
     if not token:
         return None
     return token

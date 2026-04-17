@@ -206,6 +206,46 @@ async def test_api_key_branch_disabled_then_enabled(async_client):
 
 
 @pytest.mark.asyncio
+async def test_anthropic_messages_accepts_x_api_key(async_client, monkeypatch):
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    async with SessionLocal() as session:
+        service = ApiKeysService(ApiKeysRepository(session))
+        created = await service.create_key(
+            ApiKeyCreateData(
+                name="anthropic-key",
+                allowed_models=None,
+                expires_at=None,
+            )
+        )
+
+    monkeypatch.setattr(
+        "app.modules.proxy.api._effective_model_for_api_key",
+        lambda api_key, model: model,
+    )
+
+    response = await async_client.post(
+        "/v1/messages/count_tokens",
+        headers={
+            "x-api-key": created.key,
+            "anthropic-version": "2023-06-01",
+        },
+        json={"model": "gpt-5.2", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] > 0
+
+
+@pytest.mark.asyncio
 async def test_optional_proxy_key_header_is_additional_guard(async_client, monkeypatch):
     enable = await async_client.put(
         "/api/settings",

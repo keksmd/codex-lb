@@ -10,3 +10,7 @@
 ## 2026-03-12
 - For Jira recovery planning in read-only mode, cache source data (`issue + changelog/history`) first; caching only final filtered lists hides planning context and causes unnecessary refetches.
 - For CI-closed Jira rollback, prefer `Reopen Issue` over `Start Progress` to avoid auto-assigning issues and mixing newly re-opened tasks with historical personal tasks.
+
+## 2026-04-01
+- When adapting Claude to a custom backend, study the provider contract first. Claude-side provider config changes only the target URL/auth path; if the client still speaks Anthropic Messages, the proxy must expose `/v1/messages` rather than hoping `base_url` alone will bridge protocol differences.
+- If a local proxy already has a mature OpenAI/Responses stack, add the Anthropic adapter at the HTTP edge and reuse the existing routing/balancing internals instead of creating another standalone proxy process.
