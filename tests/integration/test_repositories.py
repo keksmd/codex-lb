@@ -36,13 +36,13 @@ def _make_account(account_id: str, email: str) -> Account:
 async def test_accounts_upsert_updates_existing_by_email(db_setup):
     async with SessionLocal() as session:
         repo = AccountsRepository(session)
-        await repo.upsert(_make_account("acc1", "dup@example.com"))
+        await repo.upsert(_make_account("acc1", "dup@example.com"), merge_by_email=True)
 
         updated = _make_account("acc2", "dup@example.com")
         updated.plan_type = "team"
         updated.status = AccountStatus.PAUSED
         updated.deactivation_reason = "reauth"
-        await repo.upsert(updated)
+        await repo.upsert(updated, merge_by_email=True)
 
         result = await session.execute(select(Account).where(Account.email == "dup@example.com"))
         stored = result.scalar_one()

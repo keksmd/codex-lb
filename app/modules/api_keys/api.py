@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Body, Depends, Response
+from fastapi import APIRouter, Body, Depends, Request, Response
 
+from app.core.audit.service import AuditService
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
 from app.core.exceptions import DashboardBadRequestError, DashboardNotFoundError
 from app.dependencies import ApiKeysContext, get_api_keys_context
@@ -9,7 +10,9 @@ from app.modules.api_keys.schemas import (
     ApiKeyCreateRequest,
     ApiKeyCreateResponse,
     ApiKeyResponse,
+    ApiKeyTrendsResponse,
     ApiKeyUpdateRequest,
+    ApiKeyUsage7DayResponse,
     ApiKeyUsageSummaryResponse,
     LimitRuleResponse,
 )
@@ -36,8 +39,11 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         allowed_models=row.allowed_models,
         enforced_model=row.enforced_model,
         enforced_reasoning_effort=row.enforced_reasoning_effort,
+        enforced_service_tier=row.enforced_service_tier,
         expires_at=row.expires_at,
         is_active=row.is_active,
+        account_assignment_scope_enabled=row.account_assignment_scope_enabled,
+        assigned_account_ids=row.assigned_account_ids,
         created_at=row.created_at,
         last_used_at=row.last_used_at,
         limits=[
@@ -97,6 +103,7 @@ def _build_limit_inputs(payload: ApiKeyCreateRequest | ApiKeyUpdateRequest) -> l
 
 @router.post("/", response_model=ApiKeyCreateResponse)
 async def create_api_key(
+    request: Request,
     payload: ApiKeyCreateRequest = Body(...),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyCreateResponse:
@@ -109,6 +116,7 @@ async def create_api_key(
                 allowed_models=payload.allowed_models,
                 enforced_model=payload.enforced_model,
                 enforced_reasoning_effort=payload.enforced_reasoning_effort,
+                enforced_service_tier=payload.enforced_service_tier,
                 expires_at=payload.expires_at,
                 limits=limit_inputs,
             )
@@ -116,6 +124,11 @@ async def create_api_key(
     except ValueError as exc:
         raise DashboardBadRequestError(str(exc), code="invalid_api_key_payload") from exc
     resp = _to_response(created)
+    AuditService.log_async(
+        "api_key_created",
+        actor_ip=request.client.host if request.client else None,
+        details={"key_id": created.id},
+    )
     return ApiKeyCreateResponse(
         **resp.model_dump(),
         key=created.key,
@@ -132,6 +145,7 @@ async def list_api_keys(
 
 @router.patch("/{key_id}", response_model=ApiKeyResponse)
 async def update_api_key(
+    request: Request,
     key_id: str,
     payload: ApiKeyUpdateRequest = Body(...),
     context: ApiKeysContext = Depends(get_api_keys_context),
@@ -150,10 +164,14 @@ async def update_api_key(
         enforced_model_set="enforced_model" in fields,
         enforced_reasoning_effort=payload.enforced_reasoning_effort,
         enforced_reasoning_effort_set="enforced_reasoning_effort" in fields,
+        enforced_service_tier=payload.enforced_service_tier,
+        enforced_service_tier_set="enforced_service_tier" in fields,
         expires_at=payload.expires_at,
         expires_at_set="expires_at" in fields,
         is_active=payload.is_active,
         is_active_set="is_active" in fields,
+        assigned_account_ids=payload.assigned_account_ids,
+        assigned_account_ids_set="assigned_account_ids" in fields,
         limits=limit_inputs,
         limits_set=limits_set,
         reset_usage=bool(payload.reset_usage),
@@ -164,11 +182,18 @@ async def update_api_key(
         raise DashboardNotFoundError(str(exc)) from exc
     except ValueError as exc:
         raise DashboardBadRequestError(str(exc), code="invalid_api_key_payload") from exc
+    if "is_active" in fields and payload.is_active is False and row.is_active is False:
+        AuditService.log_async(
+            "api_key_revoked",
+            actor_ip=request.client.host if request.client else None,
+            details={"key_id": row.id},
+        )
     return _to_response(row)
 
 
 @router.delete("/{key_id}")
 async def delete_api_key(
+    request: Request,
     key_id: str,
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> Response:
@@ -176,6 +201,11 @@ async def delete_api_key(
         await context.service.delete_key(key_id)
     except ApiKeyNotFoundError as exc:
         raise DashboardNotFoundError(str(exc)) from exc
+    AuditService.log_async(
+        "api_key_revoked",
+        actor_ip=request.client.host if request.client else None,
+        details={"key_id": key_id},
+    )
     return Response(status_code=204)
 
 
@@ -192,4 +222,38 @@ async def regenerate_api_key(
     return ApiKeyCreateResponse(
         **resp.model_dump(),
         key=row.key,
+    )
+
+
+@router.get("/{key_id}/trends", response_model=ApiKeyTrendsResponse)
+async def get_api_key_trends(
+    key_id: str,
+    context: ApiKeysContext = Depends(get_api_keys_context),
+) -> ApiKeyTrendsResponse:
+    from app.modules.api_keys.schemas import ApiKeyTrendPoint
+
+    result = await context.service.get_key_trends(key_id)
+    if result is None:
+        raise DashboardNotFoundError(f"API key not found: {key_id}")
+    return ApiKeyTrendsResponse(
+        key_id=result.key_id,
+        cost=[ApiKeyTrendPoint(t=p.t, v=p.v) for p in result.cost],
+        tokens=[ApiKeyTrendPoint(t=p.t, v=p.v) for p in result.tokens],
+    )
+
+
+@router.get("/{key_id}/usage-7d", response_model=ApiKeyUsage7DayResponse)
+async def get_api_key_usage_7d(
+    key_id: str,
+    context: ApiKeysContext = Depends(get_api_keys_context),
+) -> ApiKeyUsage7DayResponse:
+    result = await context.service.get_key_usage_7d(key_id)
+    if result is None:
+        raise DashboardNotFoundError(f"API key not found: {key_id}")
+    return ApiKeyUsage7DayResponse(
+        key_id=result.key_id,
+        total_tokens=result.total_tokens,
+        total_cost_usd=result.total_cost_usd,
+        total_requests=result.total_requests,
+        cached_input_tokens=result.cached_input_tokens,
     )

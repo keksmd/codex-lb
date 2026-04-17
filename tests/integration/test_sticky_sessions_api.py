@@ -11,6 +11,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.settings.repository import SettingsRepository
 from app.modules.sticky_sessions.cleanup_scheduler import StickySessionCleanupScheduler
 
 pytestmark = pytest.mark.integration
@@ -53,16 +54,8 @@ async def _create_accounts() -> list[Account]:
 
 async def _set_affinity_ttl(seconds: int) -> None:
     async with SessionLocal() as session:
-        await session.execute(
-            text(
-                """
-                UPDATE dashboard_settings
-                SET openai_cache_affinity_max_age_seconds = :seconds
-                WHERE id = 1
-                """
-            ),
-            {"seconds": seconds},
-        )
+        settings = await SettingsRepository(session).get_or_create()
+        settings.openai_cache_affinity_max_age_seconds = seconds
         await session.commit()
 
 
@@ -119,12 +112,17 @@ async def test_sticky_sessions_api_lists_metadata_and_purges_stale(async_client)
     assert response.status_code == 200
     payload = response.json()
     entries = {entry["key"]: entry for entry in payload["entries"]}
+    assert payload["total"] == 3
+    assert payload["hasMore"] is False
 
     assert entries["prompt-cache-stale"]["kind"] == "prompt_cache"
+    assert entries["prompt-cache-stale"]["displayName"] == "sticky-a@example.com"
     assert entries["prompt-cache-stale"]["isStale"] is True
     assert entries["prompt-cache-stale"]["expiresAt"] is not None
+    assert entries["prompt-cache-fresh"]["displayName"] == "sticky-a@example.com"
     assert entries["prompt-cache-fresh"]["isStale"] is False
     assert entries["codex-session-old"]["kind"] == "codex_session"
+    assert entries["codex-session-old"]["displayName"] == "sticky-b@example.com"
     assert entries["codex-session-old"]["isStale"] is False
     assert entries["codex-session-old"]["expiresAt"] is None
 
@@ -132,6 +130,8 @@ async def test_sticky_sessions_api_lists_metadata_and_purges_stale(async_client)
     assert response.status_code == 200
     stale_payload = response.json()
     assert [entry["key"] for entry in stale_payload["entries"]] == ["prompt-cache-stale"]
+    assert stale_payload["total"] == 1
+    assert stale_payload["hasMore"] is False
 
     response = await async_client.post("/api/sticky-sessions/purge", json={"staleOnly": True})
     assert response.status_code == 200
@@ -141,6 +141,133 @@ async def test_sticky_sessions_api_lists_metadata_and_purges_stale(async_client)
     assert response.status_code == 200
     remaining_keys = {entry["key"] for entry in response.json()["entries"]}
     assert remaining_keys == {"prompt-cache-fresh", "codex-session-old"}
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_filters_by_account_and_key(async_client):
+    accounts = await _create_accounts()
+    await _set_affinity_ttl(60)
+    await _insert_sticky_session(
+        key="alpha-thread-1",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=5,
+    )
+    await _insert_sticky_session(
+        key="alpha-thread-2",
+        account_id=accounts[1].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=10,
+    )
+    await _insert_sticky_session(
+        key="beta-cache",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.PROMPT_CACHE,
+        updated_at_offset_seconds=15,
+    )
+
+    response = await async_client.get("/api/sticky-sessions", params={"accountQuery": "sticky-a"})
+    assert response.status_code == 200
+    assert {(entry["key"], entry["displayName"]) for entry in response.json()["entries"]} == {
+        ("alpha-thread-1", "sticky-a@example.com"),
+        ("beta-cache", "sticky-a@example.com"),
+    }
+    assert response.json()["total"] == 2
+
+    response = await async_client.get("/api/sticky-sessions", params={"keyQuery": "alpha-thread"})
+    assert response.status_code == 200
+    assert {(entry["key"], entry["displayName"]) for entry in response.json()["entries"]} == {
+        ("alpha-thread-1", "sticky-a@example.com"),
+        ("alpha-thread-2", "sticky-b@example.com"),
+    }
+    assert response.json()["total"] == 2
+
+    response = await async_client.get(
+        "/api/sticky-sessions",
+        params={"accountQuery": "sticky-a", "keyQuery": "beta"},
+    )
+    assert response.status_code == 200
+    assert [(entry["key"], entry["displayName"]) for entry in response.json()["entries"]] == [
+        ("beta-cache", "sticky-a@example.com")
+    ]
+    assert response.json()["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_sorts_by_supported_fields(async_client):
+    accounts = await _create_accounts()
+    await _set_affinity_ttl(60)
+    await _insert_sticky_session(
+        key="sort-z",
+        account_id=accounts[1].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=20,
+    )
+    await _insert_sticky_session(
+        key="sort-a",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=10,
+    )
+    await _insert_sticky_session(
+        key="sort-m",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=30,
+    )
+
+    response = await async_client.get("/api/sticky-sessions", params={"sortBy": "key", "sortDir": "asc"})
+    assert response.status_code == 200
+    assert [entry["key"] for entry in response.json()["entries"]] == ["sort-a", "sort-m", "sort-z"]
+
+    response = await async_client.get("/api/sticky-sessions", params={"sortBy": "account", "sortDir": "asc"})
+    assert response.status_code == 200
+    assert [entry["displayName"] for entry in response.json()["entries"]] == [
+        "sticky-a@example.com",
+        "sticky-a@example.com",
+        "sticky-b@example.com",
+    ]
+
+    response = await async_client.get("/api/sticky-sessions", params={"sortBy": "updated_at", "sortDir": "asc"})
+    assert response.status_code == 200
+    assert [entry["key"] for entry in response.json()["entries"]] == ["sort-m", "sort-z", "sort-a"]
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_deletes_filtered_rows(async_client):
+    accounts = await _create_accounts()
+    await _set_affinity_ttl(60)
+    await _insert_sticky_session(
+        key="cleanup-alpha-1",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=5,
+    )
+    await _insert_sticky_session(
+        key="cleanup-alpha-2",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.PROMPT_CACHE,
+        updated_at_offset_seconds=10,
+    )
+    await _insert_sticky_session(
+        key="cleanup-beta",
+        account_id=accounts[1].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=15,
+    )
+
+    response = await async_client.post(
+        "/api/sticky-sessions/delete-filtered",
+        json={"accountQuery": "sticky-a", "keyQuery": "cleanup-alpha"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"deletedCount": 2}
+
+    response = await async_client.get("/api/sticky-sessions")
+    assert response.status_code == 200
+    assert {(entry["key"], entry["displayName"]) for entry in response.json()["entries"]} == {
+        ("cleanup-beta", "sticky-b@example.com")
+    }
 
 
 @pytest.mark.asyncio
@@ -196,19 +323,25 @@ async def test_sticky_sessions_api_counts_hidden_stale_rows_and_deletes_by_kind(
         updated_at_offset_seconds=5,
     )
 
-    response = await async_client.get("/api/sticky-sessions")
+    response = await async_client.get("/api/sticky-sessions", params={"limit": "10", "offset": "0"})
     assert response.status_code == 200
     payload = response.json()
 
     assert payload["stalePromptCacheCount"] == 1
-    assert len(payload["entries"]) == 100
+    assert payload["total"] == 103
+    assert payload["hasMore"] is True
+    assert len(payload["entries"]) == 10
     assert not any(entry["key"] == "shared-key" and entry["kind"] == "prompt_cache" for entry in payload["entries"])
     assert any(entry["key"] == "shared-key" and entry["kind"] == "codex_session" for entry in payload["entries"])
 
-    response = await async_client.get("/api/sticky-sessions", params={"staleOnly": "true"})
+    response = await async_client.get(
+        "/api/sticky-sessions", params={"staleOnly": "true", "limit": "10", "offset": "0"}
+    )
     assert response.status_code == 200
     stale_payload = response.json()
     assert stale_payload["stalePromptCacheCount"] == 1
+    assert stale_payload["total"] == 1
+    assert stale_payload["hasMore"] is False
     assert [(entry["key"], entry["kind"]) for entry in stale_payload["entries"]] == [("shared-key", "prompt_cache")]
 
     response = await async_client.delete("/api/sticky-sessions/prompt_cache/shared-key")
@@ -218,7 +351,131 @@ async def test_sticky_sessions_api_counts_hidden_stale_rows_and_deletes_by_kind(
     assert response.status_code == 200
     after_delete = response.json()
     assert after_delete["stalePromptCacheCount"] == 0
+    assert after_delete["total"] == 102
     assert any(entry["key"] == "shared-key" and entry["kind"] == "codex_session" for entry in after_delete["entries"])
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_applies_offset_before_returning_page(async_client):
+    accounts = await _create_accounts()
+    await _set_affinity_ttl(60)
+
+    for index in range(15):
+        await _insert_sticky_session(
+            key=f"page-session-{index:02d}",
+            account_id=accounts[index % len(accounts)].id,
+            kind=StickySessionKind.STICKY_THREAD,
+            updated_at_offset_seconds=index + 1,
+        )
+
+    response = await async_client.get("/api/sticky-sessions", params={"limit": "10", "offset": "10"})
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["total"] == 15
+    assert payload["hasMore"] is False
+    assert len(payload["entries"]) == 5
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_deletes_selected_identifiers(async_client):
+    accounts = await _create_accounts()
+    await _set_affinity_ttl(60)
+
+    await _insert_sticky_session(
+        key="shared-key",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.PROMPT_CACHE,
+        updated_at_offset_seconds=600,
+    )
+    await _insert_sticky_session(
+        key="shared-key",
+        account_id=accounts[1].id,
+        kind=StickySessionKind.CODEX_SESSION,
+        updated_at_offset_seconds=5,
+    )
+    await _insert_sticky_session(
+        key="folder/session",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.STICKY_THREAD,
+        updated_at_offset_seconds=5,
+    )
+
+    response = await async_client.post(
+        "/api/sticky-sessions/delete",
+        json={
+            "sessions": [
+                {"key": "shared-key", "kind": "prompt_cache"},
+                {"key": "folder/session", "kind": "sticky_thread"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["deletedCount"] == 2
+    assert response.json()["deleted"] == [
+        {"key": "shared-key", "kind": "prompt_cache"},
+        {"key": "folder/session", "kind": "sticky_thread"},
+    ]
+    assert response.json()["failed"] == []
+
+    response = await async_client.get("/api/sticky-sessions")
+    assert response.status_code == 200
+    remaining = {(entry["key"], entry["kind"]) for entry in response.json()["entries"]}
+    assert remaining == {("shared-key", "codex_session")}
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_reports_partial_failures_for_bulk_delete(async_client):
+    accounts = await _create_accounts()
+    await _set_affinity_ttl(60)
+
+    await _insert_sticky_session(
+        key="shared-key",
+        account_id=accounts[0].id,
+        kind=StickySessionKind.PROMPT_CACHE,
+        updated_at_offset_seconds=600,
+    )
+
+    response = await async_client.post(
+        "/api/sticky-sessions/delete",
+        json={
+            "sessions": [
+                {"key": "shared-key", "kind": "prompt_cache"},
+                {"key": "missing-key", "kind": "sticky_thread"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "deletedCount": 1,
+        "deleted": [
+            {"key": "shared-key", "kind": "prompt_cache"},
+        ],
+        "failed": [
+            {"key": "missing-key", "kind": "sticky_thread", "reason": "not_found"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_sticky_sessions_api_rejects_duplicate_bulk_delete_targets(async_client):
+    response = await async_client.post(
+        "/api/sticky-sessions/delete",
+        json={
+            "sessions": [
+                {"key": "shared-key", "kind": "prompt_cache"},
+                {"key": "shared-key", "kind": "prompt_cache"},
+            ]
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "validation_error",
+            "message": "Invalid request payload",
+        }
+    }
 
 
 @pytest.mark.asyncio

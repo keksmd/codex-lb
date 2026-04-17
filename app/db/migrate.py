@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -13,6 +16,7 @@ from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from anyio import to_thread
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.engine import Connection
 
 from app.core.config.settings import get_settings
@@ -63,8 +67,16 @@ _BRANCHED_ENFORCEMENT_DESCENDANT_REVISIONS = frozenset(
     }
 )
 _MANUAL_DRIFT_INDEX_REQUIREMENTS: dict[str, frozenset[str]] = {
-    "usage_history": frozenset({"idx_usage_window_account_latest"}),
-    "request_logs": frozenset({"idx_logs_requested_at_id"}),
+    "usage_history": frozenset({"idx_usage_window_account_latest", "idx_usage_window_account_time"}),
+    "request_logs": frozenset(
+        {
+            "idx_logs_requested_at_id",
+            "idx_logs_requested_at_model_tier",
+            "idx_logs_model_effort_time",
+            "idx_logs_status_error_time",
+        }
+    ),
+    "api_keys": frozenset({"idx_api_keys_name"}),
 }
 
 
@@ -114,6 +126,26 @@ def _required_sqlalchemy_url(config: Config) -> str:
     return sync_database_url
 
 
+@contextmanager
+def _sync_connection(sync_database_url: str) -> Iterator[Connection]:
+    engine = create_engine(sync_database_url, future=True)
+    try:
+        with engine.connect() as connection:
+            yield connection
+    finally:
+        engine.dispose()
+
+
+@contextmanager
+def _sync_transaction(sync_database_url: str) -> Iterator[Connection]:
+    engine = create_engine(sync_database_url, future=True)
+    try:
+        with engine.begin() as connection:
+            yield connection
+    finally:
+        engine.dispose()
+
+
 def _read_table_names(connection: Connection) -> set[str]:
     inspector = inspect(connection)
     return set(inspector.get_table_names())
@@ -126,7 +158,19 @@ def _read_legacy_migration_names(connection: Connection) -> set[str]:
 
 
 def _read_current_revisions_from_connection(connection: Connection) -> tuple[str, ...]:
-    rows = connection.execute(text(f"SELECT {_ALEMBIC_VERSION_COLUMN} FROM {_ALEMBIC_VERSION_TABLE}")).fetchall()
+    try:
+        rows = connection.execute(text(f"SELECT {_ALEMBIC_VERSION_COLUMN} FROM {_ALEMBIC_VERSION_TABLE}")).fetchall()
+    except (sa_exc.ProgrammingError, sa_exc.OperationalError) as exc:
+        # PostgreSQL can still raise UndefinedTable here on a fresh database if
+        # the alembic_version table is absent when startup migration state is
+        # re-read. SQLite raises OperationalError for the same missing-table
+        # path. Treat both the same as "no revision yet".
+        message = str(exc).lower()
+        if _ALEMBIC_VERSION_TABLE in message and (
+            "does not exist" in message or "undefinedtable" in message or "no such table" in message
+        ):
+            return ()
+        raise
     revisions = {str(row[0]) for row in rows if row and row[0]}
     return tuple(sorted(revisions))
 
@@ -162,7 +206,7 @@ def _missing_required_legacy_tables_for_stamp(tables: set[str]) -> tuple[str, ..
 def _bootstrap_legacy_history(config: Config) -> LegacyBootstrapResult:
     sync_database_url = _required_sqlalchemy_url(config)
 
-    with create_engine(sync_database_url, future=True).connect() as connection:
+    with _sync_connection(sync_database_url) as connection:
         tables = _read_table_names(connection)
         if _ALEMBIC_VERSION_TABLE in tables:
             return LegacyBootstrapResult(
@@ -229,7 +273,7 @@ def _bootstrap_legacy_history(config: Config) -> LegacyBootstrapResult:
 
 
 def _read_current_revision(sync_database_url: str) -> str | None:
-    with create_engine(sync_database_url, future=True).connect() as connection:
+    with _sync_connection(sync_database_url) as connection:
         tables = _read_table_names(connection)
         if _ALEMBIC_VERSION_TABLE not in tables:
             return None
@@ -301,7 +345,7 @@ def _ensure_alembic_version_table_capacity_for_connection(connection: Connection
 def _ensure_alembic_version_table_capacity(config: Config) -> None:
     sync_database_url = _required_sqlalchemy_url(config)
     required_length = _max_revision_id_length(config)
-    with create_engine(sync_database_url, future=True).begin() as connection:
+    with _sync_transaction(sync_database_url) as connection:
         _ensure_alembic_version_table_capacity_for_connection(connection, required_length=required_length)
 
 
@@ -349,7 +393,7 @@ def _remap_legacy_alembic_revisions(config: Config) -> tuple[str, ...]:
     sync_database_url = _required_sqlalchemy_url(config)
     known_revisions = _known_revisions(config)
 
-    with create_engine(sync_database_url, future=True).begin() as connection:
+    with _sync_transaction(sync_database_url) as connection:
         tables = _read_table_names(connection)
         if _ALEMBIC_VERSION_TABLE not in tables:
             return ()
@@ -407,7 +451,7 @@ def inspect_migration_state(database_url: str) -> MigrationState:
     sync_database_url = _required_sqlalchemy_url(config)
     head_revision = _head_revision(config)
 
-    with create_engine(sync_database_url, future=True).connect() as connection:
+    with _sync_connection(sync_database_url) as connection:
         tables = _read_table_names(connection)
         has_alembic = _ALEMBIC_VERSION_TABLE in tables
         has_legacy = _LEGACY_MIGRATIONS_TABLE in tables
@@ -474,7 +518,7 @@ def check_schema_drift(database_url: str) -> tuple[str, ...]:
     config = _build_alembic_config(database_url)
     sync_database_url = _required_sqlalchemy_url(config)
 
-    with create_engine(sync_database_url, future=True).connect() as connection:
+    with _sync_connection(sync_database_url) as connection:
         migration_context = MigrationContext.configure(
             connection=connection,
             opts={
@@ -506,6 +550,12 @@ def run_upgrade(
     auto_remap_legacy_revisions: bool = True,
 ) -> MigrationRunResult:
     config = _build_alembic_config(database_url)
+    state_before = inspect_migration_state(database_url)
+    config.attributes["codex_lb_fresh_install"] = (
+        state_before.current_revision is None
+        and not state_before.has_alembic_version_table
+        and not state_before.has_legacy_migrations_table
+    )
 
     bootstrap_result = LegacyBootstrapResult(
         stamped_revision=None,
@@ -516,6 +566,8 @@ def run_upgrade(
 
     if bootstrap_legacy:
         bootstrap_result = _bootstrap_legacy_history(config)
+        if bootstrap_result.stamped_revision is not None:
+            config.attributes["codex_lb_fresh_install"] = False
 
     _ensure_alembic_version_table_capacity(config)
     if auto_remap_legacy_revisions:
@@ -559,6 +611,71 @@ def stamp_revision(database_url: str, revision: str) -> None:
     command.stamp(config, revision)
 
 
+def wait_for_connection(
+    database_url: str,
+    *,
+    timeout_seconds: float,
+    interval_seconds: float = 2.0,
+) -> None:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than 0")
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be greater than 0")
+
+    started_at = time.monotonic()
+    last_error: Exception | None = None
+    sync_database_url = to_sync_database_url(database_url)
+
+    while True:
+        try:
+            with _sync_connection(sync_database_url):
+                return
+        except Exception as exc:
+            last_error = exc
+        elapsed = time.monotonic() - started_at
+        if elapsed >= timeout_seconds:
+            if last_error is not None:
+                raise TimeoutError(
+                    f"Timed out waiting for database connectivity after {timeout_seconds:.1f}s: {last_error}"
+                ) from last_error
+            raise TimeoutError(f"Timed out waiting for database connectivity after {timeout_seconds:.1f}s")
+        time.sleep(min(interval_seconds, timeout_seconds - elapsed))
+
+
+def wait_for_head(
+    database_url: str,
+    *,
+    timeout_seconds: float,
+    interval_seconds: float = 2.0,
+) -> MigrationState:
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be greater than 0")
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be greater than 0")
+
+    started_at = time.monotonic()
+    last_error: Exception | None = None
+
+    while True:
+        try:
+            state = inspect_migration_state(database_url)
+            if not state.needs_upgrade:
+                return state
+        except Exception as exc:
+            last_error = exc
+        elapsed = time.monotonic() - started_at
+        if elapsed >= timeout_seconds:
+            if last_error is not None:
+                raise TimeoutError(
+                    f"Timed out waiting for database schema to reach Alembic head after {timeout_seconds:.1f}s: "
+                    f"{last_error}"
+                ) from last_error
+            raise TimeoutError(
+                f"Timed out waiting for database schema to reach Alembic head after {timeout_seconds:.1f}s"
+            )
+        time.sleep(min(interval_seconds, timeout_seconds - elapsed))
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Database migration utility for codex-lb.")
     parser.add_argument(
@@ -585,6 +702,40 @@ def _parse_args() -> argparse.Namespace:
     subparsers.add_parser("current", help="Print current alembic revision.")
 
     subparsers.add_parser("check", help="Check Alembic policy and model/schema drift.")
+
+    wait_parser = subparsers.add_parser(
+        "wait-for-head",
+        help="Wait until the database schema reaches Alembic head without applying migrations locally.",
+    )
+    wait_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=300.0,
+        help="Maximum seconds to wait for the schema to reach Alembic head.",
+    )
+    wait_parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=2.0,
+        help="Polling interval in seconds while waiting for the schema to reach Alembic head.",
+    )
+
+    connect_parser = subparsers.add_parser(
+        "wait-for-connection",
+        help="Wait until the database accepts connections without applying migrations locally.",
+    )
+    connect_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=300.0,
+        help="Maximum seconds to wait for database connectivity.",
+    )
+    connect_parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=2.0,
+        help="Polling interval in seconds while waiting for database connectivity.",
+    )
 
     stamp_parser = subparsers.add_parser("stamp", help="Set current revision without running migrations.")
     stamp_parser.add_argument("revision")
@@ -633,6 +784,25 @@ def main() -> None:
     if args.command == "stamp":
         stamp_revision(database_url, args.revision)
         print(f"stamped={args.revision}")
+        return
+
+    if args.command == "wait-for-head":
+        state = wait_for_head(
+            database_url,
+            timeout_seconds=args.timeout_seconds,
+            interval_seconds=args.interval_seconds,
+        )
+        print(f"current_revision={state.current_revision or 'none'}")
+        print(f"head_revision={state.head_revision}")
+        return
+
+    if args.command == "wait-for-connection":
+        wait_for_connection(
+            database_url,
+            timeout_seconds=args.timeout_seconds,
+            interval_seconds=args.interval_seconds,
+        )
+        print("database_connection=ready")
         return
 
     raise RuntimeError(f"unsupported command: {args.command}")

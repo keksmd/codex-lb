@@ -1,8 +1,12 @@
 import { del, get, post } from "@/lib/api-client";
 
 import {
-  StickySessionDeleteResponseSchema,
   StickySessionIdentifierSchema,
+  StickySessionsDeleteFilteredRequestSchema,
+  StickySessionsDeleteFilteredResponseSchema,
+  StickySessionsDeleteRequestSchema,
+  StickySessionsDeleteResponseSchema,
+  StickySessionsListParamsSchema,
   StickySessionsListResponseSchema,
   StickySessionsPurgeRequestSchema,
   StickySessionsPurgeResponseSchema,
@@ -10,16 +14,41 @@ import {
 
 const STICKY_SESSIONS_PATH = "/api/sticky-sessions";
 
-export function listStickySessions() {
-  return get(STICKY_SESSIONS_PATH, StickySessionsListResponseSchema);
+export function listStickySessions(params: unknown) {
+  const validated = StickySessionsListParamsSchema.parse(params);
+  const searchParams = new URLSearchParams({
+    staleOnly: String(validated.staleOnly),
+    offset: String(validated.offset),
+    limit: String(validated.limit),
+  });
+  if (validated.accountQuery) {
+    searchParams.set("accountQuery", validated.accountQuery);
+  }
+  if (validated.keyQuery) {
+    searchParams.set("keyQuery", validated.keyQuery);
+  }
+  searchParams.set("sortBy", validated.sortBy);
+  searchParams.set("sortDir", validated.sortDir);
+  return get(`${STICKY_SESSIONS_PATH}?${searchParams.toString()}`, StickySessionsListResponseSchema);
 }
 
 export function deleteStickySession(payload: unknown) {
   const validated = StickySessionIdentifierSchema.parse(payload);
-  return del(
-    `${STICKY_SESSIONS_PATH}/${validated.kind}/${encodeURIComponent(validated.key)}`,
-    StickySessionDeleteResponseSchema,
-  );
+  return del(`${STICKY_SESSIONS_PATH}/${validated.kind}/${encodeURIComponent(validated.key)}`);
+}
+
+export function deleteStickySessions(payload: unknown) {
+  const validated = StickySessionsDeleteRequestSchema.parse(payload);
+  return post(`${STICKY_SESSIONS_PATH}/delete`, StickySessionsDeleteResponseSchema, {
+    body: validated,
+  });
+}
+
+export function deleteFilteredStickySessions(payload: unknown) {
+  const validated = StickySessionsDeleteFilteredRequestSchema.parse(payload);
+  return post(`${STICKY_SESSIONS_PATH}/delete-filtered`, StickySessionsDeleteFilteredResponseSchema, {
+    body: validated,
+  });
 }
 
 export function purgeStickySessions(payload: unknown) {

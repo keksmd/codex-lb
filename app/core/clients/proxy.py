@@ -11,26 +11,50 @@ import logging
 import os
 import socket
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncContextManager, AsyncIterator, Awaitable, Mapping, Protocol, TypeAlias, cast
+from typing import (
+    AsyncContextManager,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    Protocol,
+    TypeAlias,
+    TypeVar,
+    cast,
+)
 from urllib.parse import ParseResult, urlparse, urlunparse
 
 import aiohttp
 from aiohttp import hdrs
-from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT
+from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
+from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
 from multidict import CIMultiDict
 
 from app.core.clients.http import get_http_client, get_http_proxy_request_kwargs
-from app.core.config.settings import get_settings
-from app.core.errors import OpenAIErrorEnvelope, ResponseFailedEvent, openai_error, response_failed_event
+from app.core.config.settings import Settings, get_settings
+from app.core.errors import (
+    OpenAIErrorDetail,
+    OpenAIErrorEnvelope,
+    ResponseFailedEvent,
+    openai_error,
+    response_failed_event,
+)
 from app.core.openai.model_registry import get_model_registry
-from app.core.openai.models import CompactResponsePayload
+from app.core.openai.models import CompactResponsePayload, OpenAIError
 from app.core.openai.parsing import (
     parse_compact_response_payload,
     parse_error_payload,
     parse_sse_event,
 )
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
+from app.core.resilience.circuit_breaker import (
+    CircuitBreaker,
+    CircuitBreakerOpenError,
+    _is_server_error,
+    get_circuit_breaker_for_account,
+)
 from app.core.types import JsonObject, JsonValue
 from app.core.utils.request_id import get_request_id
 from app.core.utils.sse import format_sse_event
@@ -58,7 +82,7 @@ _SSE_EVENT_TYPE_ALIASES = {
     "response.audio_transcript.delta": "response.output_audio_transcript.delta",
 }
 
-_SSE_READ_CHUNK_SIZE = 8 * 1024
+_SSE_READ_CHUNK_SIZE = 1 * 1024
 _IMAGE_INLINE_MAX_BYTES = 8 * 1024 * 1024
 _IMAGE_INLINE_CHUNK_SIZE = 64 * 1024
 _IMAGE_INLINE_TIMEOUT_SECONDS = 8.0
@@ -81,9 +105,19 @@ _UPSTREAM_TRACE_HEADER_ALLOWLIST = frozenset(
         "x-request-id",
     }
 )
-_NATIVE_CODEX_ORIGINATORS = frozenset({"codex_cli_rs", "Codex Desktop"})
+_NATIVE_CODEX_ORIGINATORS = frozenset(
+    {
+        "Codex Desktop",
+        "codex_atlas",
+        "codex_chatgpt_desktop",
+        "codex_cli_rs",
+        "codex_exec",
+        "codex_vscode",
+    }
+)
 _NATIVE_CODEX_STREAM_HEADER_KEYS = frozenset(
     {
+        "x-codex-turn-state",
         "x-codex-turn-metadata",
         "x-codex-beta-features",
     }
@@ -103,9 +137,10 @@ _HOP_BY_HOP_HEADER_NAMES = frozenset(
         "upgrade",
     }
 )
-_AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES = frozenset({403, 404, 426})
+_AUTO_WEBSOCKET_HANDSHAKE_FALLBACK_STATUSES = frozenset({426})
 _WEBSOCKET_RESPONSE_CREATE_EXCLUDED_FIELDS = frozenset({"background", "stream"})
 _WEBSOCKET_HANDSHAKE_ERROR_HINTS = (
+    ("account_deactivated", "account has been deactivated"),
     ("usage_not_included", "usage not included"),
     ("insufficient_quota", "insufficient quota"),
     ("quota_exceeded", "quota exceeded"),
@@ -142,6 +177,93 @@ _TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = conte
     "transcribe_total_timeout_override",
     default=None,
 )
+
+R = TypeVar("R")
+
+
+async def _call_with_service_circuit_breaker(
+    request: Awaitable[R],
+    *,
+    settings: Settings | None = None,
+    account_id: str | None = None,
+) -> R:
+    if not account_id:
+        return await request
+    effective_settings = settings or get_settings()
+    circuit_breaker = get_circuit_breaker_for_account(account_id, effective_settings)
+    if circuit_breaker is None:
+        return await request
+    return await circuit_breaker.call(request)
+
+
+@asynccontextmanager
+async def _service_circuit_breaker_context(
+    cm: AsyncContextManager[aiohttp.ClientResponse],
+    *,
+    settings: Settings | None = None,
+    account_id: str | None = None,
+) -> AsyncIterator[aiohttp.ClientResponse]:
+    """Wrap an async context manager with circuit breaker protection."""
+    effective_settings = settings or get_settings()
+    cb = get_circuit_breaker_for_account(account_id, effective_settings) if account_id else None
+    is_probe = False
+    if cb is not None:
+        try:
+            is_probe = await cb.pre_call_check()
+        except BaseException:
+            close = getattr(cm, "close", None)
+            if callable(close):
+                close()
+            raise
+    resp_ref: aiohttp.ClientResponse | None = None
+    try:
+        async with cm as resp:
+            resp_ref = resp
+            yield resp
+        if cb is not None:
+            if hasattr(resp, "status") and resp.status >= 500:
+                await cb._record_failure(Exception(f"HTTP {resp.status}"))
+            else:
+                await cb._record_success()
+    except CircuitBreakerOpenError:
+        raise
+    except Exception as e:
+        if cb is not None:
+            if (
+                resp_ref is not None
+                and hasattr(resp_ref, "status")
+                and resp_ref.status < 500
+                and not _is_server_error(e)
+            ):
+                await cb._record_success()
+            else:
+                await cb._record_failure(e)
+        raise
+    finally:
+        if is_probe and cb is not None:
+            await cb.release_half_open_probe()
+
+
+_HELD_HALF_OPEN_PROBE_FLAG = "_codex_lb_half_open_probe_held"
+_HELD_HALF_OPEN_PROBE_BREAKER = "_codex_lb_half_open_probe_breaker"
+
+
+def _bind_half_open_probe(
+    websocket: aiohttp.ClientWebSocketResponse,
+    circuit_breaker: "CircuitBreaker",
+) -> None:
+    setattr(websocket, _HELD_HALF_OPEN_PROBE_FLAG, True)
+    setattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, circuit_breaker)
+
+
+async def _release_bound_half_open_probe(websocket: aiohttp.ClientWebSocketResponse | None) -> None:
+    if websocket is None or not getattr(websocket, _HELD_HALF_OPEN_PROBE_FLAG, False):
+        return
+    circuit_breaker = cast("CircuitBreaker | None", getattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, None))
+    setattr(websocket, _HELD_HALF_OPEN_PROBE_FLAG, False)
+    setattr(websocket, _HELD_HALF_OPEN_PROBE_BREAKER, None)
+    if circuit_breaker is not None:
+        await circuit_breaker.release_half_open_probe()
 
 
 class StreamIdleTimeoutError(Exception):
@@ -241,6 +363,30 @@ def _build_upstream_headers(
     headers["Content-Type"] = "application/json"
     if account_id:
         headers["chatgpt-account-id"] = account_id
+    return headers
+
+
+_TRANSCRIBE_FORWARD_HEADER_PREFIXES = ("x-openai-", "x-codex-")
+
+
+def _build_upstream_transcribe_headers(
+    inbound: Mapping[str, str],
+    access_token: str,
+    account_id: str | None,
+) -> dict[str, str]:
+    # Minimal header set matching Codex CLI ``/transcribe`` fingerprint.
+    # Omit Accept, x-request-id, and bulk-forwarded inbound headers to
+    # avoid upstream WAF rejection.
+    headers: dict[str, str] = {}
+    headers["Authorization"] = f"Bearer {access_token}"
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    for key, value in inbound.items():
+        lower = key.lower()
+        if lower == "user-agent":
+            headers[key] = value
+        elif lower.startswith(_TRANSCRIBE_FORWARD_HEADER_PREFIXES):
+            headers[key] = value
     return headers
 
 
@@ -374,7 +520,7 @@ def _error_payload_from_websocket_handshake_error(exc: aiohttp.WSServerHandshake
     if extracted is not None:
         error = parse_error_payload(extracted)
         if error is not None:
-            return {"error": error.model_dump(exclude_none=True)}
+            return {"error": _openai_error_detail(error)}
 
     code = _infer_websocket_handshake_error_code(exc.status, message)
     if code == "invalid_api_key":
@@ -660,14 +806,33 @@ async def _error_payload_from_response(resp: ErrorResponse) -> OpenAIErrorEnvelo
     if isinstance(data, dict):
         error = parse_error_payload(data)
         if error:
-            return {"error": error.model_dump(exclude_none=True)}
+            return {"error": _openai_error_detail(error)}
         message = _extract_upstream_message(data)
         if message:
             return openai_error("upstream_error", message)
     return openai_error("upstream_error", fallback_message)
 
 
-def _extract_upstream_message(data: Mapping[str, object]) -> str | None:
+def _openai_error_detail(error: OpenAIError) -> OpenAIErrorDetail:
+    detail: OpenAIErrorDetail = {}
+    if error.message is not None:
+        detail["message"] = error.message
+    if error.type is not None:
+        detail["type"] = error.type
+    if error.code is not None:
+        detail["code"] = error.code
+    if error.param is not None:
+        detail["param"] = error.param
+    if error.plan_type is not None:
+        detail["plan_type"] = error.plan_type
+    if error.resets_at is not None:
+        detail["resets_at"] = error.resets_at
+    if error.resets_in_seconds is not None:
+        detail["resets_in_seconds"] = error.resets_in_seconds
+    return detail
+
+
+def _extract_upstream_message(data: Mapping[str, JsonValue]) -> str | None:
     for key in ("message", "detail", "error"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
@@ -696,6 +861,9 @@ def _normalize_sse_data_line(line: str) -> str:
 
 def _normalize_sse_event_block(event_block: str) -> str:
     if not event_block:
+        return event_block
+
+    if '"type":' not in event_block:
         return event_block
 
     if event_block.endswith("\r\n\r\n"):
@@ -762,9 +930,18 @@ def _configured_stream_transport(
 def _has_native_codex_transport_headers(headers: Mapping[str, str]) -> bool:
     normalized = {key.lower(): value for key, value in headers.items()}
     originator = normalized.get("originator")
-    if isinstance(originator, str) and originator in _NATIVE_CODEX_ORIGINATORS:
+    if _is_native_codex_originator(originator):
         return True
     return any(key in normalized for key in _NATIVE_CODEX_STREAM_HEADER_KEYS)
+
+
+def _is_native_codex_originator(originator: str | None) -> bool:
+    if originator is None:
+        return False
+    stripped = originator.strip()
+    if not stripped:
+        return False
+    return stripped in _NATIVE_CODEX_ORIGINATORS
 
 
 def _resolve_stream_transport(
@@ -812,19 +989,38 @@ async def _open_upstream_websocket(
     headers: Mapping[str, str],
     connect_timeout_seconds: float,
     max_msg_size: int,
+    account_id: str | None = None,
+    hold_half_open_probe: bool = False,
 ) -> tuple[AsyncContextManager[aiohttp.ClientWebSocketResponse], aiohttp.ClientWebSocketResponse]:
-    request = getattr(session, "request", None)
-    if not callable(request):
-        websocket_cm = session.ws_connect(
-            url,
-            headers=headers,
-            receive_timeout=None,
-            autoping=True,
-            autoclose=True,
-            max_msg_size=max_msg_size,
-        )
-        websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
-        return websocket_cm, websocket
+    settings = get_settings()
+    circuit_breaker = get_circuit_breaker_for_account(account_id, settings) if account_id else None
+    is_probe = False
+    if circuit_breaker is not None:
+        is_probe = await circuit_breaker.pre_call_check()
+
+    request_obj = getattr(session, "request", None)
+    if not callable(request_obj):
+        try:
+            websocket_cm = session.ws_connect(
+                url,
+                headers=headers,
+                receive_timeout=None,
+                autoping=True,
+                autoclose=True,
+                max_msg_size=max_msg_size,
+            )
+            websocket = await asyncio.wait_for(websocket_cm.__aenter__(), timeout=connect_timeout_seconds)
+            if hold_half_open_probe and is_probe and circuit_breaker is not None:
+                _bind_half_open_probe(websocket, circuit_breaker)
+            return websocket_cm, websocket
+        except Exception as exc:
+            if circuit_breaker is not None:
+                await circuit_breaker._record_failure(exc)
+            raise
+        finally:
+            if is_probe and circuit_breaker is not None and not hold_half_open_probe:
+                await circuit_breaker.release_half_open_probe()
+    request = cast(Callable[..., Awaitable[aiohttp.ClientResponse]], request_obj)
 
     request_headers = CIMultiDict(headers)
     request_headers.setdefault(hdrs.UPGRADE, "websocket")
@@ -834,72 +1030,95 @@ async def _open_upstream_websocket(
     request_headers[hdrs.SEC_WEBSOCKET_KEY] = sec_key
 
     timeout = aiohttp.ClientTimeout(total=connect_timeout_seconds, sock_connect=connect_timeout_seconds)
-    resp = await request(
-        hdrs.METH_GET,
-        url,
-        headers=request_headers,
-        timeout=timeout,
-        read_until_eof=False,
-    )
-
-    async def _raise_handshake_error(message: str) -> None:
-        body_text = ""
-        try:
-            body_text = (await resp.text()).strip()
-        except Exception:
-            body_text = ""
-        raise aiohttp.WSServerHandshakeError(
-            resp.request_info,
-            resp.history,
-            message=body_text or message,
-            status=resp.status,
-            headers=resp.headers,
-        )
-
     try:
-        if resp.status != 101:
-            await _raise_handshake_error("Invalid response status")
+        try:
+            resp = await request(
+                hdrs.METH_GET,
+                url,
+                headers=request_headers,
+                timeout=timeout,
+                read_until_eof=False,
+            )
+        except Exception as exc:
+            if circuit_breaker is not None:
+                await circuit_breaker._record_failure(exc)
+            raise
 
-        if resp.headers.get(hdrs.UPGRADE, "").lower() != "websocket":
-            await _raise_handshake_error("Invalid upgrade header")
+        async def _raise_handshake_error(message: str) -> None:
+            body_text = ""
+            try:
+                body_text = (await resp.text()).strip()
+            except Exception:
+                body_text = ""
+            raise aiohttp.WSServerHandshakeError(
+                resp.request_info,
+                resp.history,
+                message=body_text or message,
+                status=resp.status,
+                headers=resp.headers,
+            )
 
-        if resp.headers.get(hdrs.CONNECTION, "").lower() != "upgrade":
-            await _raise_handshake_error("Invalid connection header")
+        _cb_recorded = False
+        try:
+            if circuit_breaker is not None:
+                if resp.status >= 500:
+                    await circuit_breaker._record_failure(Exception(f"WebSocket handshake failed: HTTP {resp.status}"))
+                    _cb_recorded = True
+                elif resp.status != 101:
+                    await circuit_breaker._record_success()
+                    _cb_recorded = True
 
-        response_key = resp.headers.get(hdrs.SEC_WEBSOCKET_ACCEPT, "")
-        expected_key = base64.b64encode(hashlib.sha1(sec_key.encode() + aiohttp.client.WS_KEY).digest()).decode()
-        if response_key != expected_key:
-            await _raise_handshake_error("Invalid challenge response")
+            if resp.status != 101:
+                await _raise_handshake_error("Invalid response status")
 
-        conn = resp.connection
-        assert conn is not None
-        conn_proto = conn.protocol
-        assert conn_proto is not None
-        conn_proto.read_timeout = None
+            if resp.headers.get(hdrs.UPGRADE, "").lower() != "websocket":
+                await _raise_handshake_error("Invalid upgrade header")
 
-        transport = conn.transport
-        assert transport is not None
-        reader = aiohttp.client.WebSocketDataQueue(conn_proto, 2**16, loop=session._loop)
-        conn_proto.set_parser(aiohttp.client.WebSocketReader(reader, max_msg_size), reader)
-        writer = aiohttp.client.WebSocketWriter(conn_proto, transport, use_mask=True, compress=0, notakeover=False)
-    except BaseException:
-        resp.close()
-        raise
+            if resp.headers.get(hdrs.CONNECTION, "").lower() != "upgrade":
+                await _raise_handshake_error("Invalid connection header")
 
-    websocket = session._ws_response_class(
-        reader,
-        writer,
-        None,
-        resp,
-        DEFAULT_WS_CLIENT_TIMEOUT,
-        True,
-        True,
-        session._loop,
-        heartbeat=None,
-        compress=0,
-        client_notakeover=False,
-    )
-    return websocket, websocket
+            response_key = resp.headers.get(hdrs.SEC_WEBSOCKET_ACCEPT, "")
+            expected_key = base64.b64encode(hashlib.sha1(sec_key.encode() + WS_KEY).digest()).decode()
+            if response_key != expected_key:
+                await _raise_handshake_error("Invalid challenge response")
+
+            conn = resp.connection
+            assert conn is not None
+            conn_proto = conn.protocol
+            assert conn_proto is not None
+            conn_proto.read_timeout = None
+
+            transport = conn.transport
+            assert transport is not None
+            reader = WebSocketDataQueue(conn_proto, 2**16, loop=session._loop)
+            conn_proto.set_parser(WebSocketReader(reader, max_msg_size), reader)
+            writer = WebSocketWriter(conn_proto, transport, use_mask=True, compress=0, notakeover=False)
+        except BaseException as exc:
+            if circuit_breaker is not None and not _cb_recorded and isinstance(exc, Exception):
+                await circuit_breaker._record_failure(exc)
+                _cb_recorded = True
+            resp.close()
+            raise
+
+        websocket = session._ws_response_class(
+            reader,
+            writer,
+            None,
+            resp,
+            DEFAULT_WS_CLIENT_TIMEOUT,
+            True,
+            True,
+            session._loop,
+            heartbeat=None,
+            compress=0,
+            client_notakeover=False,
+        )
+        if hold_half_open_probe and is_probe and circuit_breaker is not None:
+            _bind_half_open_probe(websocket, circuit_breaker)
+        return websocket, websocket
+    finally:
+        if is_probe and circuit_breaker is not None and not hold_half_open_probe:
+            await circuit_breaker.release_half_open_probe()
 
 
 async def _stream_websocket_events(
@@ -972,12 +1191,34 @@ async def _stream_responses_via_websocket(
     effective_idle_timeout: float,
     max_event_bytes: int,
     raise_for_status: bool,
+    account_id: str | None = None,
 ) -> AsyncIterator[str]:
     websocket_url = _to_websocket_upstream_url(url)
     request_started_at = time.monotonic()
     request_payload = _build_websocket_response_create_payload(payload_dict)
     websocket_cm: AsyncContextManager[aiohttp.ClientWebSocketResponse] | None = None
     websocket: aiohttp.ClientWebSocketResponse | None = None
+    circuit_breaker = None
+    lifecycle_recorded = False
+    seen_terminal = False
+    settings = get_settings()
+    if account_id is not None:
+        circuit_breaker = get_circuit_breaker_for_account(account_id, settings)
+
+    async def _record_lifecycle_success() -> None:
+        nonlocal lifecycle_recorded
+        if circuit_breaker is None or lifecycle_recorded:
+            return
+        await circuit_breaker._record_success()
+        lifecycle_recorded = True
+
+    async def _record_lifecycle_failure(exc: Exception) -> None:
+        nonlocal lifecycle_recorded
+        if circuit_breaker is None or lifecycle_recorded:
+            return
+        await circuit_breaker._record_failure(exc)
+        lifecycle_recorded = True
+
     connect_timeout_seconds = min(
         effective_connect_timeout,
         _remaining_total_timeout(effective_total_timeout, request_started_at, time.monotonic())
@@ -989,6 +1230,8 @@ async def _stream_responses_via_websocket(
         headers=headers,
         connect_timeout_seconds=connect_timeout_seconds,
         max_msg_size=max_event_bytes,
+        account_id=account_id,
+        hold_half_open_probe=True,
     )
 
     try:
@@ -1000,7 +1243,7 @@ async def _stream_responses_via_websocket(
         )
         if callable(send_json):
             await asyncio.wait_for(
-                cast(Any, send_json)(request_payload),
+                cast(Callable[[JsonObject], Awaitable[None]], send_json)(request_payload),
                 timeout=remaining_total_timeout,
             )
         else:
@@ -1019,10 +1262,22 @@ async def _stream_responses_via_websocket(
             total_timeout_seconds=remaining_total_timeout,
             max_event_bytes=max_event_bytes,
         ):
+            parsed_event = parse_sse_event(event)
+            if parsed_event and parsed_event.type in ("response.completed", "response.failed", "response.incomplete"):
+                seen_terminal = True
+                await _record_lifecycle_success()
             yield event
+        if not seen_terminal:
+            await _record_lifecycle_failure(aiohttp.ClientError("Upstream websocket closed without terminal event"))
+    except Exception as exc:
+        await _record_lifecycle_failure(exc)
+        raise
     finally:
-        if websocket_cm is not None:
-            await websocket_cm.__aexit__(None, None, None)
+        try:
+            if websocket_cm is not None:
+                await websocket_cm.__aexit__(None, None, None)
+        finally:
+            await _release_bound_half_open_probe(websocket)
 
 
 def _build_websocket_response_create_payload(payload_dict: JsonObject) -> JsonObject:
@@ -1369,12 +1624,16 @@ async def stream_responses(
     ) -> AsyncIterator[str]:
         nonlocal status_code, error_code, error_message, seen_terminal
 
-        async with client_session.post(
-            url,
-            json=payload_dict,
-            headers=current_headers,
-            timeout=current_timeout,
-            **proxy_kwargs,
+        async with _service_circuit_breaker_context(
+            client_session.post(
+                url,
+                json=payload_dict,
+                headers=current_headers,
+                timeout=current_timeout,
+                **proxy_kwargs,
+            ),
+            settings=settings,
+            account_id=account_id,
         ) as resp:
             status_code = resp.status
             if resp.status >= 400:
@@ -1425,6 +1684,7 @@ async def stream_responses(
                     effective_idle_timeout=effective_idle_timeout,
                     max_event_bytes=settings.max_sse_event_bytes,
                     raise_for_status=raise_for_status,
+                    account_id=account_id,
                 ):
                     if status_code is None:
                         status_code = 101
@@ -1521,6 +1781,13 @@ async def stream_responses(
                 str(exc),
                 response_id=get_request_id(),
             ),
+        )
+        return
+    except CircuitBreakerOpenError:
+        error_code = "upstream_unavailable"
+        error_message = "Upstream circuit breaker is open"
+        yield format_sse_event(
+            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
         )
         return
     except aiohttp.ClientError as exc:
@@ -1687,7 +1954,7 @@ async def compact_responses(
 
 
 def _is_retryable_compact_status(status_code: int) -> bool:
-    return status_code in {401, 502, 503, 504}
+    return status_code in {401, 500, 502, 503, 504}
 
 
 @dataclass(slots=True)
@@ -1759,12 +2026,16 @@ class _CompactCommandTransport:
             else None,
         )
         try:
-            async with self.session.post(
-                url,
-                json=payload_dict,
-                headers=upstream_headers,
-                timeout=timeout,
-                **proxy_kwargs,
+            async with _service_circuit_breaker_context(
+                self.session.post(
+                    url,
+                    json=payload_dict,
+                    headers=upstream_headers,
+                    timeout=timeout,
+                    **proxy_kwargs,
+                ),
+                settings=settings,
+                account_id=self.account_id,
             ) as resp:
                 status_code = resp.status
                 if resp.status >= 400:
@@ -1838,6 +2109,21 @@ class _CompactCommandTransport:
             if retryable_same_contract is None:
                 retryable_same_contract = exc.retryable_same_contract
             raise
+        except CircuitBreakerOpenError as exc:
+            error_code = "upstream_unavailable"
+            error_message = "Upstream circuit breaker is open"
+            failure_phase = "connect"
+            failure_detail = str(exc)
+            failure_exception_type = type(exc).__name__
+            retryable_same_contract = True
+            raise ProxyResponseError(
+                503,
+                openai_error("upstream_unavailable", error_message),
+                failure_phase=failure_phase,
+                retryable_same_contract=retryable_same_contract,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+            ) from exc
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             message = str(exc) or "Request to upstream timed out"
             error_code = "upstream_unavailable"
@@ -1887,15 +2173,11 @@ async def transcribe_audio(
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
     url = f"{upstream_base}/transcribe"
-    upstream_headers = _build_upstream_headers(
+    upstream_headers = _build_upstream_transcribe_headers(
         headers,
         access_token,
         account_id,
-        accept="application/json",
     )
-    for header_name in tuple(upstream_headers):
-        if header_name.lower() == "content-type":
-            upstream_headers.pop(header_name, None)
 
     effective_total_timeout = _effective_transcribe_total_timeout(
         settings.transcription_request_budget_seconds,
@@ -1947,12 +2229,16 @@ async def transcribe_audio(
         else None,
     )
     try:
-        async with client_session.post(
-            url,
-            data=form,
-            headers=upstream_headers,
-            timeout=timeout,
-            **proxy_kwargs,
+        async with _service_circuit_breaker_context(
+            client_session.post(
+                url,
+                data=form,
+                headers=upstream_headers,
+                timeout=timeout,
+                **proxy_kwargs,
+            ),
+            settings=settings,
+            account_id=account_id,
         ) as resp:
             status_code = resp.status
             if resp.status >= 400:
@@ -1986,6 +2272,13 @@ async def transcribe_audio(
         if error_code is None and error_message is None:
             error_code, error_message = _error_details_from_envelope(exc.payload)
         raise
+    except CircuitBreakerOpenError as exc:
+        error_code = "upstream_unavailable"
+        error_message = "Upstream circuit breaker is open"
+        raise ProxyResponseError(
+            503,
+            openai_error("upstream_unavailable", error_message),
+        ) from exc
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         message = str(exc) or "Request to upstream timed out"
         error_code = "upstream_unavailable"

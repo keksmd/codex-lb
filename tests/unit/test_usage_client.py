@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, cast
 
 import pytest
 
@@ -126,7 +127,7 @@ async def test_fetch_usage_retries_and_returns_payload(usage_server):
         base_url=base_url,
         max_retries=1,
         timeout_seconds=2.0,
-        client=client,
+        client=cast(Any, client),
     )
     assert data.plan_type == "plus"
     assert state.calls == 2
@@ -144,7 +145,7 @@ async def test_fetch_usage_raises_after_retries(failing_usage_server):
             base_url=base_url,
             max_retries=0,
             timeout_seconds=1.0,
-            client=client,
+            client=cast(Any, client),
         )
     exc = excinfo.value
     assert isinstance(exc, UsageFetchError)
@@ -166,8 +167,41 @@ async def test_fetch_usage_sanitizes_html_error_body() -> None:
             base_url="http://usage.test/backend-api",
             max_retries=0,
             timeout_seconds=1.0,
-            client=client,
+            client=cast(Any, client),
         )
 
     assert excinfo.value.status_code == 403
     assert excinfo.value.message == "Upstream returned an HTML error response"
+
+
+@pytest.mark.asyncio
+async def test_fetch_usage_preserves_error_code():
+    state = UsageClientState()
+    responses = [
+        StubResponse(
+            401,
+            {
+                "error": {
+                    "code": "account_deactivated",
+                    "message": "Your OpenAI account has been deactivated.",
+                }
+            },
+            "",
+        )
+    ]
+    client = StubRetryClient(responses, state)
+
+    with pytest.raises(UsageFetchError) as excinfo:
+        await fetch_usage(
+            access_token="access-token",
+            account_id=None,
+            base_url="http://usage.test/backend-api",
+            max_retries=0,
+            timeout_seconds=1.0,
+            client=cast(Any, client),
+        )
+
+    exc = excinfo.value
+    assert exc.status_code == 401
+    assert exc.code == "account_deactivated"
+    assert "deactivated" in exc.message.lower()

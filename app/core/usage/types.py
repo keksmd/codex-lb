@@ -118,3 +118,14 @@ class BucketModelAggregate:
     output_tokens: int
     cached_input_tokens: int
     reasoning_tokens: int
+    cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class RequestActivityAggregate:
+    request_count: int
+    error_count: int
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    cost_usd: float

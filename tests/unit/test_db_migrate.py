@@ -4,11 +4,15 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from alembic.util.exc import CommandError
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import exc as sa_exc
+from sqlalchemy.engine import Connection
 
+import app.db.migrate as migrate_module
 from app.db.alembic.revision_ids import OLD_TO_NEW_REVISION_MAP
 from app.db.backup import create_sqlite_pre_migration_backup, list_sqlite_pre_migration_backups
 from app.db.migrate import (
@@ -17,10 +21,13 @@ from app.db.migrate import (
     _collect_migration_policy_violations,
     _ensure_alembic_version_table_capacity_for_connection,
     _max_revision_id_length,
+    _read_current_revisions_from_connection,
     check_migration_policy,
     check_schema_drift,
     inspect_migration_state,
     run_upgrade,
+    wait_for_connection,
+    wait_for_head,
 )
 from app.db.migration_url import to_sync_database_url
 from app.db.models import Base
@@ -29,6 +36,43 @@ from app.modules.usage.additional_quota_keys import clear_additional_quota_regis
 
 def _db_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path}"
+
+
+def test_check_schema_drift_disposes_sync_engine(monkeypatch) -> None:
+    class _FakeConnectionContext:
+        def __init__(self) -> None:
+            self.connection = object()
+
+        def __enter__(self) -> object:
+            return self.connection
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.connection_context = _FakeConnectionContext()
+            self.disposed = False
+
+        def connect(self) -> _FakeConnectionContext:
+            return self.connection_context
+
+        def dispose(self) -> None:
+            self.disposed = True
+
+    fake_engine = _FakeEngine()
+
+    monkeypatch.setattr(migrate_module, "create_engine", lambda *args, **kwargs: fake_engine)
+    monkeypatch.setattr(
+        migrate_module.MigrationContext,
+        "configure",
+        lambda *, connection, opts: SimpleNamespace(connection=connection, opts=opts),
+    )
+    monkeypatch.setattr(migrate_module, "compare_metadata", lambda context, metadata: [])
+    monkeypatch.setattr(migrate_module, "_manual_schema_drift_diffs", lambda connection: ())
+
+    assert check_schema_drift("sqlite+aiosqlite:///tmp/drift.db") == ()
+    assert fake_engine.disposed is True
 
 
 def test_inspect_migration_state_requires_upgrade_when_uninitialized(tmp_path: Path) -> None:
@@ -51,6 +95,96 @@ def test_inspect_migration_state_no_upgrade_after_head(tmp_path: Path) -> None:
     assert state.needs_upgrade is False
     assert state.current_revision == state.head_revision
     assert state.has_alembic_version_table is True
+
+
+def test_wait_for_head_returns_once_schema_is_current(monkeypatch) -> None:
+    states = iter(
+        [
+            SimpleNamespace(
+                current_revision=None,
+                head_revision="head",
+                has_alembic_version_table=False,
+                has_legacy_migrations_table=False,
+                needs_upgrade=True,
+            ),
+            SimpleNamespace(
+                current_revision="head",
+                head_revision="head",
+                has_alembic_version_table=True,
+                has_legacy_migrations_table=False,
+                needs_upgrade=False,
+            ),
+        ]
+    )
+    sleep_calls: list[float] = []
+
+    monkeypatch.setattr(migrate_module, "inspect_migration_state", lambda _url: next(states))
+    monkeypatch.setattr(migrate_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monotonic_values = iter([0.0, 0.5])
+    monkeypatch.setattr(migrate_module.time, "monotonic", lambda: next(monotonic_values, 0.5))
+
+    state = wait_for_head("sqlite+aiosqlite:///tmp/test.db", timeout_seconds=5.0, interval_seconds=1.0)
+
+    assert state.current_revision == "head"
+    assert sleep_calls == [1.0]
+
+
+def test_wait_for_head_times_out_when_schema_never_reaches_head(monkeypatch) -> None:
+    monkeypatch.setattr(
+        migrate_module,
+        "inspect_migration_state",
+        lambda _url: SimpleNamespace(
+            current_revision=None,
+            head_revision="head",
+            has_alembic_version_table=False,
+            has_legacy_migrations_table=False,
+            needs_upgrade=True,
+        ),
+    )
+    monkeypatch.setattr(migrate_module.time, "sleep", lambda _seconds: None)
+    monotonic_values = iter([0.0, 1.0, 2.1])
+    monkeypatch.setattr(migrate_module.time, "monotonic", lambda: next(monotonic_values, 2.1))
+
+    with pytest.raises(TimeoutError, match="Timed out waiting for database schema to reach Alembic head"):
+        wait_for_head("sqlite+aiosqlite:///tmp/test.db", timeout_seconds=2.0, interval_seconds=1.0)
+
+
+def test_wait_for_connection_returns_once_database_is_reachable(monkeypatch) -> None:
+    attempts = {"count": 0}
+    sleep_calls: list[float] = []
+
+    class _FakeContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    def _sync_connection(_: str):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("db not ready")
+        return _FakeContext()
+
+    monkeypatch.setattr(migrate_module, "_sync_connection", _sync_connection)
+    monkeypatch.setattr(migrate_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monotonic_values = iter([0.0, 0.5])
+    monkeypatch.setattr(migrate_module.time, "monotonic", lambda: next(monotonic_values, 0.5))
+
+    wait_for_connection("sqlite+aiosqlite:///tmp/test.db", timeout_seconds=5.0, interval_seconds=1.0)
+
+    assert attempts["count"] == 2
+    assert sleep_calls == [1.0]
+
+
+def test_wait_for_connection_times_out_when_database_stays_unreachable(monkeypatch) -> None:
+    monkeypatch.setattr(migrate_module, "_sync_connection", lambda _: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(migrate_module.time, "sleep", lambda _seconds: None)
+    monotonic_values = iter([0.0, 1.0, 2.1])
+    monkeypatch.setattr(migrate_module.time, "monotonic", lambda: next(monotonic_values, 2.1))
+
+    with pytest.raises(TimeoutError, match="Timed out waiting for database connectivity"):
+        wait_for_connection("sqlite+aiosqlite:///tmp/test.db", timeout_seconds=2.0, interval_seconds=1.0)
 
 
 def test_schema_migration_contract_matches_after_upgrade(tmp_path: Path) -> None:
@@ -129,6 +263,29 @@ def test_check_schema_drift_detects_missing_manual_performance_index(tmp_path: P
 
     drift = check_schema_drift(url)
     assert any("idx_usage_window_account_latest" in diff for diff in drift)
+
+
+def test_check_schema_drift_detects_missing_dashboard_read_indexes(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing-dashboard-read-indexes.db"
+    url = _db_url(db_path)
+
+    run_upgrade(url, "head", bootstrap_legacy=False)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).connect() as connection:
+        connection.execute(text("DROP INDEX idx_usage_window_account_time"))
+        connection.execute(text("DROP INDEX idx_logs_requested_at_model_tier"))
+        connection.execute(text("DROP INDEX idx_logs_model_effort_time"))
+        connection.execute(text("DROP INDEX idx_logs_status_error_time"))
+        connection.execute(text("DROP INDEX idx_api_keys_name"))
+        connection.commit()
+
+    drift = check_schema_drift(url)
+    assert any("idx_usage_window_account_time" in diff for diff in drift)
+    assert any("idx_logs_requested_at_model_tier" in diff for diff in drift)
+    assert any("idx_logs_model_effort_time" in diff for diff in drift)
+    assert any("idx_logs_status_error_time" in diff for diff in drift)
+    assert any("idx_api_keys_name" in diff for diff in drift)
 
 
 def test_run_upgrade_auto_remaps_legacy_revision_ids(tmp_path: Path) -> None:
@@ -218,6 +375,19 @@ def test_run_upgrade_repairs_branched_legacy_revision_ids_with_parallel_head(tmp
 
     result = run_upgrade(url, "head", bootstrap_legacy=False)
     assert result.current_revision == inspect_migration_state(url).head_revision
+
+
+def test_api_key_enforced_service_tier_column_exists_after_head_upgrade(tmp_path: Path) -> None:
+    db_path = tmp_path / "api-key-service-tier.db"
+    url = _db_url(db_path)
+
+    run_upgrade(url, "head", bootstrap_legacy=False)
+
+    sync_url = to_sync_database_url(url)
+    with create_engine(sync_url, future=True).connect() as connection:
+        api_key_columns = {column["name"] for column in inspect(connection).get_columns("api_keys")}
+
+    assert "enforced_service_tier" in api_key_columns
 
 
 def test_run_upgrade_backfills_additional_usage_quota_key_from_configured_registry(
@@ -453,6 +623,24 @@ class _FakeConnection:
         self.executed_sql.append(str(statement))
 
 
+class _MissingAlembicVersionConnection:
+    def execute(self, statement: object) -> None:
+        raise sa_exc.ProgrammingError(
+            str(statement),
+            {},
+            Exception('relation "alembic_version" does not exist'),
+        )
+
+
+class _MissingAlembicVersionSQLiteConnection:
+    def execute(self, statement: object) -> None:
+        raise sa_exc.OperationalError(
+            str(statement),
+            {},
+            Exception("no such table: alembic_version"),
+        )
+
+
 class _FakeInspector:
     def __init__(self, *, has_table: bool, version_num_length: int | None = None) -> None:
         self._has_table = has_table
@@ -492,6 +680,18 @@ def test_ensure_alembic_version_table_capacity_alters_short_column(monkeypatch) 
     _ensure_alembic_version_table_capacity_for_connection(connection, required_length=64)  # type: ignore[arg-type]
 
     assert connection.executed_sql == ["ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)"]
+
+
+def test_read_current_revisions_returns_empty_when_alembic_version_table_is_missing() -> None:
+    connection = _MissingAlembicVersionConnection()
+
+    assert _read_current_revisions_from_connection(cast(Connection, connection)) == ()
+
+
+def test_read_current_revisions_returns_empty_when_alembic_version_table_is_missing_on_sqlite() -> None:
+    connection = _MissingAlembicVersionSQLiteConnection()
+
+    assert _read_current_revisions_from_connection(cast(Connection, connection)) == ()
 
 
 def test_max_revision_id_length_exceeds_alembic_default(tmp_path: Path) -> None:

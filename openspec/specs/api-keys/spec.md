@@ -1,54 +1,26 @@
 # api-keys Specification
 
 ## Purpose
-TBD - created by archiving change admin-auth-and-api-keys. Update Purpose after archive.
+
+See context docs for background.
+
 ## Requirements
+
 ### Requirement: API Key creation
+The system SHALL allow the admin to create API keys via `POST /api/api-keys` with a `name` (required), `allowed_models` (optional list), `weekly_token_limit` (optional integer), and `expires_at` (optional ISO 8601 datetime). The system MUST generate a key in the format `sk-clb-{48 hex chars}`, store only the `sha256` hash in the database, and return the plain key exactly once in the creation response. The system MUST accept timezone-aware ISO 8601 datetimes for `expiresAt`, normalize them to UTC naive for persistence, and return the expiration as UTC in API responses.
 
-The system SHALL allow the admin to create API keys via `POST /api/api-keys` with a `name` (required), `allowed_models` (optional list), `weekly_token_limit` (optional integer), and `expires_at` (optional ISO 8601 datetime). The system MUST generate a key in the format `sk-clb-{48 hex chars}`, store only the `sha256` hash in the database, and return the plain key exactly once in the creation response.
-
-#### Scenario: Create key with all options
-
-- **WHEN** admin submits `POST /api/api-keys` with `{ "name": "dev-key", "allowedModels": ["o3-pro"], "weeklyTokenLimit": 1000000, "expiresAt": "2025-12-31T00:00:00Z" }`
-- **THEN** the system returns `{ "id": "<uuid>", "name": "dev-key", "key": "sk-clb-...", "keyPrefix": "sk-clb-a1b2c3d4", "allowedModels": ["o3-pro"], "weeklyTokenLimit": 1000000, "expiresAt": "2025-12-31T00:00:00Z", "createdAt": "..." }` with the plain key visible only in this response
-
-#### Scenario: Create key with defaults
-
-- **WHEN** admin submits `POST /api/api-keys` with `{ "name": "open-key" }` and no optional fields
-- **THEN** the system creates a key with `allowedModels: null` (all models), `weeklyTokenLimit: null` (unlimited), `expiresAt: null` (no expiration)
-
-#### Scenario: Create key with duplicate name
-
-- **WHEN** admin submits a key with a `name` that already exists
-- **THEN** the system creates the key (names are labels, not unique constraints)
-
-### Requirement: API Key listing
-
-The system SHALL expose `GET /api/api-keys` returning all API keys with their metadata. The response MUST NOT include the key hash or plain key. Each key MUST include `id`, `name`, `keyPrefix`, `allowedModels`, `weeklyTokenLimit`, `weeklyTokensUsed`, `weeklyResetAt`, `expiresAt`, `isActive`, `createdAt`, and `lastUsedAt`.
-
-#### Scenario: List keys
-
-- **WHEN** admin calls `GET /api/api-keys`
-- **THEN** the system returns an array of key objects ordered by `createdAt` descending, without `key` or `keyHash` fields
-
-#### Scenario: No keys exist
-
-- **WHEN** no API keys have been created
-- **THEN** the system returns an empty array `[]`
+#### Scenario: Create key with timezone-aware expiration
+- **WHEN** admin submits `POST /api/api-keys` with `{ "name": "dev-key", "expiresAt": "2025-12-31T00:00:00Z" }`
+- **THEN** the system persists the expiration successfully without PostgreSQL datetime binding errors
+- **AND** the response returns `expiresAt` representing the same UTC instant
 
 ### Requirement: API Key update
+The system SHALL allow updating key properties via `PATCH /api/api-keys/{id}`. Updatable fields: `name`, `allowedModels`, `weeklyTokenLimit`, `expiresAt`, `isActive`. The key hash and prefix MUST NOT be modifiable. The system MUST accept timezone-aware ISO 8601 datetimes for `expiresAt` and normalize them to UTC naive before persistence.
 
-The system SHALL allow updating key properties via `PATCH /api/api-keys/{id}`. Updatable fields: `name`, `allowedModels`, `weeklyTokenLimit`, `expiresAt`, `isActive`. The key hash and prefix MUST NOT be modifiable.
-
-#### Scenario: Update allowed models
-
-- **WHEN** admin submits `PATCH /api/api-keys/{id}` with `{ "allowedModels": ["o3-pro", "gpt-4.1"] }`
-- **THEN** the system updates the allowed models list and returns the updated key
-
-#### Scenario: Deactivate key
-
-- **WHEN** admin submits `PATCH /api/api-keys/{id}` with `{ "isActive": false }`
-- **THEN** the key is deactivated; subsequent Bearer requests using this key SHALL be rejected with 401
+#### Scenario: Update key with timezone-aware expiration
+- **WHEN** admin submits `PATCH /api/api-keys/{id}` with `{ "expiresAt": "2025-12-31T00:00:00Z" }`
+- **THEN** the system persists the expiration successfully without PostgreSQL datetime binding errors
+- **AND** the response returns `expiresAt` representing the same UTC instant
 
 #### Scenario: Update non-existent key
 
@@ -80,17 +52,30 @@ The system SHALL allow regenerating an API key via `POST /api/api-keys/{id}/rege
 
 ### Requirement: API Key authentication global switch
 
-The system SHALL provide an `api_key_auth_enabled` boolean in `DashboardSettings`. When false (default), all proxy endpoints allow unauthenticated access. When true, all proxy endpoints require a valid API key via `Authorization: Bearer <key>`.
+The system SHALL provide an `api_key_auth_enabled` boolean in `DashboardSettings`. When false (default), local requests to protected proxy routes MAY proceed without an API key. Operators MAY additionally opt specific non-local proxy clients into unauthenticated access by configuring `proxy_unauthenticated_client_cidrs`. Requests that are neither local nor explicitly allowlisted MUST be rejected until proxy authentication is configured. When true, protected proxy routes require a valid API key via `Authorization: Bearer <key>`.
 
 #### Scenario: Enable API key auth
 
 - **WHEN** admin submits `PUT /api/settings` with `{ "apiKeyAuthEnabled": true }`
 - **THEN** subsequent proxy requests without a valid Bearer token are rejected with 401
 
-#### Scenario: Disable API key auth
+#### Scenario: Disable API key auth for a local request
 
 - **WHEN** admin submits `PUT /api/settings` with `{ "apiKeyAuthEnabled": false }`
-- **THEN** proxy requests are allowed without authentication
+- **AND** a local client calls a protected proxy route
+- **THEN** the request is allowed without API key authentication
+
+#### Scenario: Disable API key auth for a non-local request
+
+- **WHEN** admin submits `PUT /api/settings` with `{ "apiKeyAuthEnabled": false }`
+- **AND** a non-local client calls a protected proxy route
+- **THEN** the request is rejected with 401 until proxy authentication is configured
+
+#### Scenario: Disable API key auth for an explicitly allowlisted proxy client
+
+- **WHEN** admin submits `PUT /api/settings` with `{ "apiKeyAuthEnabled": false }`
+- **AND** the request socket peer IP belongs to configured `proxy_unauthenticated_client_cidrs`
+- **THEN** the protected proxy route proceeds without API key authentication
 
 #### Scenario: Enable without any keys created
 
@@ -99,7 +84,7 @@ The system SHALL provide an `api_key_auth_enabled` boolean in `DashboardSettings
 
 ### Requirement: API Key Bearer authentication guard
 
-The system SHALL validate API keys on proxy routes (`/v1/*`, `/backend-api/codex/*`, `/backend-api/transcribe`) when `api_key_auth_enabled` is true. Validation MUST be implemented as a router-level `Security` dependency, not ASGI middleware. The dependency MUST compute `sha256` of the Bearer token and look up the hash in the `api_keys` table.
+The system SHALL validate API keys on protected proxy routes (`/v1/*`, `/backend-api/codex/*`, `/backend-api/transcribe`) when `api_key_auth_enabled` is true. Validation MUST be implemented as a router-level `Security` dependency, not ASGI middleware. The dependency MUST compute `sha256` of the Bearer token and look up the hash in the `api_keys` table.
 
 The dependency SHALL return a typed `ApiKeyData` value directly to the route handler. Route handlers MUST NOT access API key data via `request.state`.
 
@@ -122,9 +107,10 @@ The dependency SHALL raise a domain exception on validation failure. The excepti
 - **WHEN** `api_key_auth_enabled` is true and a valid Bearer token is provided
 - **THEN** the route handler receives a typed `ApiKeyData` parameter (not `request.state`)
 
-#### Scenario: API key auth disabled returns None
+#### Scenario: API key auth disabled returns None for local requests
 
 - **WHEN** `api_key_auth_enabled` is false
+- **AND** the request is classified as local
 - **THEN** the dependency returns `None` and the request proceeds without authentication
 
 ### Requirement: Optional additional proxy header guard
@@ -152,6 +138,21 @@ The system SHALL support an optional additional proxy guard controlled by `CODEX
 
 - **WHEN** `CODEX_LB_PROXY_KEY_AUTH_ENABLED=true` but `CODEX_LB_PROXY_KEY` is missing or blank
 - **THEN** guarded proxy requests are rejected with 401
+
+#### Scenario: API key auth disabled rejects non-local requests
+
+- **WHEN** `api_key_auth_enabled` is false
+- **AND** the request is classified as non-local
+- **AND** the request socket peer IP is outside configured `proxy_unauthenticated_client_cidrs`
+- **THEN** the dependency rejects the request with 401
+
+#### Scenario: Disabled auth allowlist uses raw socket peer only
+
+- **WHEN** `api_key_auth_enabled` is false
+- **AND** forwarded headers claim a different client IP
+- **AND** the request socket peer IP is outside configured `proxy_unauthenticated_client_cidrs`
+- **THEN** the dependency rejects the request with 401
+- **AND** forwarded headers do not satisfy the explicit allowlist
 
 ### Requirement: Model restriction enforcement
 
@@ -468,3 +469,18 @@ Reservation 생성 후 upstream API 호출에 진입하지 않고 종료되는 �
 
 - **WHEN** 동일 `reservation_id`로 `finalize_usage_reservation()`이 2회 호출되면
 - **THEN** 사용량은 정확히 1회만 반영되어야 한다 (SHALL)
+
+### Requirement: gpt-5.4-mini pricing is recognized
+
+The system MUST recognize `gpt-5.4-mini` pricing when computing request costs. Snapshot aliases for the same model family MUST resolve to the canonical `gpt-5.4-mini` price table entry.
+
+#### Scenario: gpt-5.4-mini request priced at standard tier
+
+- **WHEN** a request for `gpt-5.4-mini` completes with standard service tier
+- **THEN** the system computes non-zero cost using the configured `gpt-5.4-mini` standard rates
+
+#### Scenario: gpt-5.4-mini snapshot request priced at canonical rates
+
+- **WHEN** a request for `gpt-5.4-mini-2026-03-17` completes
+- **THEN** the system resolves the snapshot alias to `gpt-5.4-mini`
+- **AND** the system applies the same standard rates

@@ -34,6 +34,7 @@ const LIMIT_TYPE_SHORT: Record<LimitType, string> = {
   input_tokens: "Input",
   output_tokens: "Output",
   cost_usd: "Cost",
+  credits: "Credits",
 };
 
 function formatLimitSummary(limits: LimitRule[]): string {
@@ -42,13 +43,15 @@ function formatLimitSummary(limits: LimitRule[]): string {
     .map((l) => {
       const type = LIMIT_TYPE_SHORT[l.limitType];
       const isCost = l.limitType === "cost_usd";
+      const isCredits = l.limitType === "credits";
       const current = isCost
         ? `$${(l.currentValue / 1_000_000).toFixed(2)}`
         : formatCompactNumber(l.currentValue);
       const max = isCost
         ? `$${(l.maxValue / 1_000_000).toFixed(2)}`
         : formatCompactNumber(l.maxValue);
-      return `${type}: ${current}/${max} ${l.limitWindow}`;
+      const suffix = isCost ? l.limitWindow : isCredits ? `${l.limitWindow}` : l.limitWindow;
+      return `${type}: ${current}/${max} ${suffix}`;
     })
     .join(" | ");
 }
@@ -64,6 +67,27 @@ function formatUsageSummary(
   const requests = formatCompactNumber(requestCount);
   const cost = formatCurrency(totalCostUsd);
   return `${total} tok | ${cached} cached | ${requests} req | ${cost}`;
+}
+
+function getUsageValue(apiKey: ApiKey): string {
+  if (!apiKey.usageSummary) {
+    return "No Usage";
+  }
+
+  return formatUsageSummary(
+    apiKey.usageSummary.requestCount,
+    apiKey.usageSummary.totalTokens,
+    apiKey.usageSummary.cachedInputTokens,
+    apiKey.usageSummary.totalCostUsd,
+  );
+}
+
+function getLimitValue(apiKey: ApiKey): string {
+  if (apiKey.limits.length === 0) {
+    return "No Limit";
+  }
+
+  return formatLimitSummary(apiKey.limits);
 }
 
 export type ApiKeyTableProps = {
@@ -87,7 +111,8 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
           <TableHead className="w-[20%] min-w-[12rem] pl-4 text-[11px] uppercase tracking-wider text-muted-foreground/80">Name</TableHead>
           <TableHead className="w-[10%] min-w-[8rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Prefix</TableHead>
           <TableHead className="w-[9%] min-w-[6.5rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Models</TableHead>
-          <TableHead className="w-[40%] min-w-[24rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Usage</TableHead>
+          <TableHead className="w-[26%] min-w-[17rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Usage</TableHead>
+          <TableHead className="w-[14%] min-w-[12rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Limit</TableHead>
           <TableHead className="w-[8%] min-w-[7rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Expiry</TableHead>
           <TableHead className="w-[7%] min-w-[5.5rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">Status</TableHead>
           <TableHead className="w-[6%] min-w-[4.5rem] pr-4 text-right text-[11px] uppercase tracking-wider text-muted-foreground/80">Actions</TableHead>
@@ -96,23 +121,14 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
       <TableBody>
         {keys.map((apiKey) => {
           const models = apiKey.allowedModels?.join(", ") || "All";
-          const usageText = apiKey.limits.length > 0
-            ? formatLimitSummary(apiKey.limits)
-            : apiKey.usageSummary && apiKey.usageSummary.requestCount > 0
-              ? formatUsageSummary(
-                  apiKey.usageSummary.requestCount,
-                  apiKey.usageSummary.totalTokens,
-                  apiKey.usageSummary.cachedInputTokens,
-                  apiKey.usageSummary.totalCostUsd,
-                )
-              : "No usage";
 
           return (
             <TableRow key={apiKey.id}>
               <TableCell className="pl-4 font-medium truncate">{apiKey.name}</TableCell>
               <TableCell className="truncate font-mono text-xs">{apiKey.keyPrefix}</TableCell>
               <TableCell className="truncate">{models}</TableCell>
-              <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{usageText}</TableCell>
+              <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getUsageValue(apiKey)}</TableCell>
+              <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getLimitValue(apiKey)}</TableCell>
               <TableCell className="truncate text-xs text-muted-foreground">{formatExpiry(apiKey.expiresAt)}</TableCell>
               <TableCell>
                 <Badge className={apiKey.isActive ? "bg-emerald-500 text-white" : "bg-zinc-500 text-white"}>

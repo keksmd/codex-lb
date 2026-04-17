@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from anyio import to_thread
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -25,6 +26,7 @@ from app.db.migrate import (
     check_schema_drift,
     inspect_migration_state,
     run_startup_migrations,
+    run_upgrade,
 )
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
@@ -277,6 +279,7 @@ async def test_postgresql_migration_contract_policy_and_drift_match(raw_db_setup
     result = await run_startup_migrations(_DATABASE_URL)
     assert result.current_revision == _HEAD_REVISION
 
+    assert check_migration_policy is not None
     assert check_migration_policy(_DATABASE_URL) == ()
     assert check_schema_drift(_DATABASE_URL) == ()
 
@@ -500,87 +503,237 @@ async def test_run_startup_migrations_drops_accounts_email_unique_with_non_casca
                 routing_strategy = (
                     await session.execute(text("SELECT routing_strategy FROM dashboard_settings WHERE id=1"))
                 ).scalar_one()
-                assert routing_strategy == "usage_weighted"
+                assert routing_strategy == "capacity_weighted"
             http_proxy_url = (
                 await session.execute(text("SELECT http_proxy_url FROM dashboard_settings WHERE id=1"))
             ).scalar_one()
             assert http_proxy_url is None
             assert "openai_cache_affinity_max_age_seconds" in dashboard_columns
-        affinity_ttl = (
+            affinity_ttl = (
+                await session.execute(
+                    text("SELECT openai_cache_affinity_max_age_seconds FROM dashboard_settings WHERE id=1")
+                )
+            ).scalar_one()
+            assert affinity_ttl == 1800
+            assert "http_responses_session_bridge_prompt_cache_idle_ttl_seconds" in dashboard_columns
+            http_responses_ttl = (
+                await session.execute(
+                    text(
+                        "SELECT http_responses_session_bridge_prompt_cache_idle_ttl_seconds"
+                        " FROM dashboard_settings WHERE id=1"
+                    )
+                )
+            ).scalar_one()
+            assert http_responses_ttl == 3600
+            assert "http_responses_session_bridge_gateway_safe_mode" in dashboard_columns
+            gateway_safe_mode = (
+                await session.execute(
+                    text("SELECT http_responses_session_bridge_gateway_safe_mode FROM dashboard_settings WHERE id=1")
+                )
+            ).scalar_one()
+            assert gateway_safe_mode in (False, 0)
+            assert "sticky_reallocation_budget_threshold_pct" in dashboard_columns
+            sticky_budget_threshold = (
+                await session.execute(
+                    text("SELECT sticky_reallocation_budget_threshold_pct FROM dashboard_settings WHERE id=1")
+                )
+            ).scalar_one()
+            assert sticky_budget_threshold == 95.0
+            sticky_columns_rows = (await session.execute(text("PRAGMA table_info(sticky_sessions)"))).fetchall()
+            sticky_columns = {str(row[1]) for row in sticky_columns_rows if len(row) > 1}
+            assert "kind" in sticky_columns
+            sticky_kind = (
+                await session.execute(text("SELECT kind FROM sticky_sessions WHERE key='sticky_1'"))
+            ).scalar_one()
+            assert sticky_kind == "sticky_thread"
             await session.execute(
-                text("SELECT openai_cache_affinity_max_age_seconds FROM dashboard_settings WHERE id=1")
+                text(
+                    """
+                    INSERT INTO sticky_sessions (key, account_id, kind, created_at, updated_at)
+                    VALUES ('sticky_1', 'acc_legacy', 'prompt_cache', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
+                    """
+                )
             )
-        ).scalar_one()
-        assert affinity_ttl == 300
-        sticky_columns_rows = (await session.execute(text("PRAGMA table_info(sticky_sessions)"))).fetchall()
-        sticky_columns = {str(row[1]) for row in sticky_columns_rows if len(row) > 1}
-        assert "kind" in sticky_columns
-        sticky_kind = (
-            await session.execute(text("SELECT kind FROM sticky_sessions WHERE key='sticky_1'"))
-        ).scalar_one()
-        assert sticky_kind == "sticky_thread"
-        await session.execute(
-            text(
-                """
-                INSERT INTO sticky_sessions (key, account_id, kind, created_at, updated_at)
-                VALUES ('sticky_1', 'acc_legacy', 'prompt_cache', '2026-01-01 00:00:00', '2026-01-01 00:00:00')
-                """
+            sticky_same_key_count = (
+                await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE key='sticky_1'"))
+            ).scalar_one()
+            assert sticky_same_key_count == 2
+            index_rows = (await session.execute(text("PRAGMA index_list(accounts)"))).fetchall()
+            has_email_non_unique_index = False
+            for row in index_rows:
+                if len(row) < 3:
+                    continue
+                index_name = str(row[1])
+                is_unique = bool(row[2])
+                escaped_name = index_name.replace('"', '""')
+                index_info_rows = (await session.execute(text(f'PRAGMA index_info("{escaped_name}")'))).fetchall()
+                column_names = [str(info[2]) for info in index_info_rows if len(info) > 2]
+                if column_names == ["email"] and not is_unique:
+                    has_email_non_unique_index = True
+                    break
+            assert has_email_non_unique_index
+            usage_index_rows = (await session.execute(text("PRAGMA index_list(usage_history)"))).fetchall()
+            usage_index_names = {str(row[1]) for row in usage_index_rows if len(row) > 1}
+            assert "idx_usage_window_account_latest" in usage_index_names
+            assert "idx_usage_window_account_time" in usage_index_names
+            request_log_index_rows = (await session.execute(text("PRAGMA index_list(request_logs)"))).fetchall()
+            request_log_index_names = {str(row[1]) for row in request_log_index_rows if len(row) > 1}
+            assert "idx_logs_requested_at_id" in request_log_index_names
+            assert "idx_logs_requested_at_model_tier" in request_log_index_names
+            assert "idx_logs_model_effort_time" in request_log_index_names
+            assert "idx_logs_status_error_time" in request_log_index_names
+            api_key_index_rows = (await session.execute(text("PRAGMA index_list(api_keys)"))).fetchall()
+            api_key_index_names = {str(row[1]) for row in api_key_index_rows if len(row) > 1}
+            assert "idx_api_keys_name" in api_key_index_names
+
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO accounts (
+                        id, chatgpt_account_id, email, plan_type,
+                        access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
+                        last_refresh, created_at, status, deactivation_reason, reset_at
+                    )
+                    VALUES (
+                        'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
+                        x'11', x'12', x'13',
+                        '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
+                    )
+                    """
+                )
+            )
+            usage_count = (
+                await session.execute(text("SELECT COUNT(*) FROM usage_history WHERE account_id='acc_legacy'"))
+            ).scalar_one()
+            logs_count = (
+                await session.execute(text("SELECT COUNT(*) FROM request_logs WHERE account_id='acc_legacy'"))
+            ).scalar_one()
+            sticky_count = (
+                await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE account_id='acc_legacy'"))
+            ).scalar_one()
+            await session.commit()
+
+            assert usage_count == 1
+            assert logs_count == 1
+            assert sticky_count == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_settings_default_flip_migration_does_not_infer_intent_from_updated_at(tmp_path):
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'dashboard-settings-defaults.sqlite'}"
+    base_revision = "20260408_010000_merge_import_without_overwrite_and_assignment_heads"
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, base_revision, bootstrap_legacy=True))
+
+    engine = create_async_engine(db_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE dashboard_settings
+                    SET sticky_threads_enabled = 0,
+                        prefer_earlier_reset_accounts = 0,
+                        password_hash = 'bcrypt$demo',
+                        updated_at = '2026-02-01 00:00:00'
+                    WHERE id = 1
+                    """
+                )
+            )
+            await session.commit()
+
+        await to_thread.run_sync(
+            lambda: run_upgrade(
+                db_url,
+                "20260409_000000_switch_sticky_threads_and_prefer_earlier_reset_defaults_to_true",
+                bootstrap_legacy=False,
             )
         )
-        sticky_same_key_count = (
-            await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE key='sticky_1'"))
-        ).scalar_one()
-        assert sticky_same_key_count == 2
-        index_rows = (await session.execute(text("PRAGMA index_list(accounts)"))).fetchall()
-        has_email_non_unique_index = False
-        for row in index_rows:
-            if len(row) < 3:
-                continue
-            index_name = str(row[1])
-            is_unique = bool(row[2])
-            escaped_name = index_name.replace('"', '""')
-            index_info_rows = (await session.execute(text(f'PRAGMA index_info("{escaped_name}")'))).fetchall()
-            column_names = [str(info[2]) for info in index_info_rows if len(info) > 2]
-            if column_names == ["email"] and not is_unique:
-                has_email_non_unique_index = True
-                break
-        assert has_email_non_unique_index
-        usage_index_rows = (await session.execute(text("PRAGMA index_list(usage_history)"))).fetchall()
-        usage_index_names = {str(row[1]) for row in usage_index_rows if len(row) > 1}
-        assert "idx_usage_window_account_latest" in usage_index_names
-        request_log_index_rows = (await session.execute(text("PRAGMA index_list(request_logs)"))).fetchall()
-        request_log_index_names = {str(row[1]) for row in request_log_index_rows if len(row) > 1}
-        assert "idx_logs_requested_at_id" in request_log_index_names
 
-        await session.execute(
-            text(
-                """
-                INSERT INTO accounts (
-                    id, chatgpt_account_id, email, plan_type,
-                    access_token_encrypted, refresh_token_encrypted, id_token_encrypted,
-                    last_refresh, created_at, status, deactivation_reason, reset_at
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT sticky_threads_enabled, prefer_earlier_reset_accounts
+                        FROM dashboard_settings
+                        WHERE id = 1
+                        """
+                    )
                 )
-                VALUES (
-                    'acc_legacy_2', 'chatgpt_legacy_2', 'legacy@example.com', 'team',
-                    x'11', x'12', x'13',
-                    '2026-01-01 00:00:00', '2026-01-01 00:00:00', 'active', NULL, NULL
-                )
-                """
-            )
+            ).one()
+            assert row[0] in (False, 0)
+            assert row[1] in (False, 0)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_settings_default_flip_migration_updates_fresh_seeded_row(tmp_path):
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'dashboard-settings-defaults-fresh.sqlite'}"
+
+    await to_thread.run_sync(
+        lambda: run_upgrade(
+            db_url,
+            "20260409_000000_switch_sticky_threads_and_prefer_earlier_reset_defaults_to_true",
+            bootstrap_legacy=True,
         )
-        usage_count = (
-            await session.execute(text("SELECT COUNT(*) FROM usage_history WHERE account_id='acc_legacy'"))
-        ).scalar_one()
-        logs_count = (
-            await session.execute(text("SELECT COUNT(*) FROM request_logs WHERE account_id='acc_legacy'"))
-        ).scalar_one()
-        sticky_count = (
-            await session.execute(text("SELECT COUNT(*) FROM sticky_sessions WHERE account_id='acc_legacy'"))
-        ).scalar_one()
-        await session.commit()
+    )
 
-        assert usage_count == 1
-        assert logs_count == 1
-        assert sticky_count == 2
+    engine = create_async_engine(db_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT sticky_threads_enabled, prefer_earlier_reset_accounts
+                        FROM dashboard_settings
+                        WHERE id = 1
+                        """
+                    )
+                )
+            ).one()
+            assert row[0] in (True, 1)
+            assert row[1] in (True, 1)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_settings_default_flip_migration_updates_pristine_fresh_db_upgraded_in_steps(tmp_path):
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'dashboard-settings-defaults-staged-fresh.sqlite'}"
+
+    await to_thread.run_sync(
+        lambda: run_upgrade(
+            db_url,
+            "20260408_010000_merge_import_without_overwrite_and_assignment_heads",
+            bootstrap_legacy=True,
+        )
+    )
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+
+    engine = create_async_engine(db_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT sticky_threads_enabled, prefer_earlier_reset_accounts
+                        FROM dashboard_settings
+                        WHERE id = 1
+                        """
+                    )
+                )
+            ).one()
+            assert row[0] in (True, 1)
+            assert row[1] in (True, 1)
     finally:
         await engine.dispose()

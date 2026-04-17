@@ -16,13 +16,11 @@ describe("UsageDonuts", () => {
         secondaryItems={[item({ accountId: "acc-2", label: "secondary@example.com", value: 80, remainingPercent: 40, color: "#d9a441" })]}
         primaryTotal={200}
         secondaryTotal={200}
-        primaryWindowMinutes={300}
-        secondaryWindowMinutes={10080}
       />,
     );
 
-    expect(screen.getByText("Primary Remaining")).toBeInTheDocument();
-    expect(screen.getByText("Secondary Remaining")).toBeInTheDocument();
+    expect(screen.getByText("5h Remaining")).toBeInTheDocument();
+    expect(screen.getByText("Weekly Remaining")).toBeInTheDocument();
     expect(screen.getByText("primary@example.com")).toBeInTheDocument();
     expect(screen.getByText("secondary@example.com")).toBeInTheDocument();
   });
@@ -34,13 +32,11 @@ describe("UsageDonuts", () => {
         secondaryItems={[]}
         primaryTotal={0}
         secondaryTotal={0}
-        primaryWindowMinutes={null}
-        secondaryWindowMinutes={null}
       />,
     );
 
-    expect(screen.getByText("Primary Remaining")).toBeInTheDocument();
-    expect(screen.getByText("Secondary Remaining")).toBeInTheDocument();
+    expect(screen.getByText("5h Remaining")).toBeInTheDocument();
+    expect(screen.getByText("Weekly Remaining")).toBeInTheDocument();
     expect(screen.getAllByText("Remaining").length).toBeGreaterThanOrEqual(2);
   });
 
@@ -51,8 +47,6 @@ describe("UsageDonuts", () => {
         secondaryItems={[item({ accountId: "acc-2", label: "secondary@example.com", value: 80, remainingPercent: 40, color: "#d9a441" })]}
         primaryTotal={200}
         secondaryTotal={200}
-        primaryWindowMinutes={300}
-        secondaryWindowMinutes={10080}
         safeLinePrimary={{ safePercent: 60, riskLevel: "warning" }}
       />,
     );
@@ -67,8 +61,6 @@ describe("UsageDonuts", () => {
         secondaryItems={[item({ accountId: "acc-2", label: "secondary@example.com", value: 80, remainingPercent: 40, color: "#d9a441" })]}
         primaryTotal={200}
         secondaryTotal={200}
-        primaryWindowMinutes={300}
-        secondaryWindowMinutes={10080}
         safeLinePrimary={{ safePercent: 60, riskLevel: "warning" }}
         safeLineSecondary={{ safePercent: 40, riskLevel: "danger" }}
       />,
@@ -84,12 +76,26 @@ describe("UsageDonuts", () => {
         secondaryItems={[item({ accountId: "acc-1", label: "weekly@example.com", value: 80, remainingPercent: 40, color: "#d9a441" })]}
         primaryTotal={0}
         secondaryTotal={200}
-        primaryWindowMinutes={null}
-        secondaryWindowMinutes={10080}
         safeLineSecondary={{ safePercent: 60, riskLevel: "warning" }}
       />,
     );
 
     expect(screen.getAllByTestId("safe-line-tick")).toHaveLength(1);
+  });
+
+  it("shows remaining totals in the center while donut totals can use capacity", () => {
+    const { container } = render(
+      <UsageDonuts
+        primaryItems={[item({ accountId: "acc-1", label: "primary@example.com", value: 120, remainingPercent: 60, color: "#7bb661" })]}
+        secondaryItems={[item({ accountId: "acc-2", label: "secondary@example.com", value: 80, remainingPercent: 40, color: "#d9a441" })]}
+        primaryTotal={225}
+        secondaryTotal={7560}
+        primaryCenterValue={120}
+        secondaryCenterValue={80}
+      />,
+    );
+
+    const centerValues = Array.from(container.querySelectorAll(".text-base.font-semibold.tabular-nums")).map((node) => node.textContent);
+    expect(centerValues).toEqual(["120", "80"]);
   });
 });

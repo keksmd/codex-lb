@@ -1,7 +1,9 @@
 # frontend-architecture Specification
 
 ## Purpose
-TBD - created by archiving change frontend-react-migration. Update Purpose after archive.
+
+See context docs for background.
+
 ## Requirements
 ### Requirement: Vite project structure
 
@@ -145,169 +147,17 @@ The Accounts page SHALL display a two-column layout: left panel with searchable 
 
 - **WHEN** a user clicks pause/resume/delete on an account
 - **THEN** the corresponding API is called and the account list is refreshed
-
 ### Requirement: Settings page
-
 The Settings page SHALL include sections for: routing settings (sticky threads, reset priority, prompt-cache affinity TTL), password management (setup/change/remove), TOTP management (setup/disable), API key auth toggle, API key management (table, create, edit, delete, regenerate), and sticky-session administration.
 
-#### Scenario: Save routing settings
-
-- **WHEN** a user toggles sticky threads, reset priority, or updates the prompt-cache affinity TTL
-- **THEN** the app calls `PUT /api/settings` with the updated values
+#### Scenario: Save prompt-cache affinity TTL
+- **WHEN** a user updates the prompt-cache affinity TTL from the routing settings section
+- **THEN** the app calls `PUT /api/settings` with the updated TTL and reflects the saved value
 
 #### Scenario: View sticky-session mappings
-
 - **WHEN** a user opens the sticky-session section on the Settings page
 - **THEN** the app fetches sticky-session entries and displays each mapping's kind, account, timestamps, and stale/expiry state
 
 #### Scenario: Purge stale prompt-cache mappings
-
 - **WHEN** a user requests a stale purge from the sticky-session section
 - **THEN** the app calls the sticky-session purge API and refreshes the list afterward
-
-#### Scenario: Password setup
-
-- **WHEN** a user sets a password from the settings page
-- **THEN** the app calls `POST /api/dashboard-auth/password/setup` and reflects the new auth state
-
-#### Scenario: API key management
-
-- **WHEN** a user creates an API key via the settings page
-- **THEN** the app calls `POST /api/api-keys` and displays the plain key in a dialog with a copy button and a warning that it will not be shown again
-
-### Requirement: API client type safety with Zod runtime validation
-
-All API calls SHALL use a shared typed fetch wrapper (`lib/api-client.ts`). Each feature MUST define Zod schemas in `schemas.ts` and typed API functions in `api.ts`. API responses MUST be validated against Zod schemas at runtime. TypeScript types MUST be derived from Zod schemas via `z.infer<>` to maintain a single source of truth.
-
-#### Scenario: Type-safe API call with runtime validation
-
-- **WHEN** a feature component calls an API function
-- **THEN** the response is parsed through a Zod schema, the return type is statically known at compile time, and any schema mismatch is detected at runtime
-
-#### Scenario: API error handling
-
-- **WHEN** an API call returns a non-2xx response
-- **THEN** the error is parsed into a structured `ApiError` and displayed to the user
-
-#### Scenario: 401 interceptor
-
-- **WHEN** any API call returns 401
-- **THEN** the auth store is updated to reflect unauthenticated state and the login form is shown
-
-#### Scenario: Zod validation failure
-
-- **WHEN** an API response does not match the expected Zod schema
-- **THEN** in development mode, a detailed error is logged to console; in production, the response is passed through with a warning
-
-### Requirement: Server state management
-
-All server data (accounts, dashboard, request logs, settings, API keys) SHALL be managed via TanStack Query. Queries MUST use semantic query keys for cache invalidation. Mutations MUST invalidate related queries on success.
-
-#### Scenario: Mutation cache invalidation
-
-- **WHEN** an account is paused via a mutation
-- **THEN** the accounts list query and dashboard overview query are both invalidated and refetched
-
-#### Scenario: Optimistic updates not required
-
-- **WHEN** a mutation is submitted
-- **THEN** the UI shows a loading state until the mutation completes; no optimistic update is applied
-
-### Requirement: Backend API response optimization
-
-The backend API response schemas SHALL be optimized to eliminate over-fetching and under-fetching. This is a BREAKING change; legacy frontend compatibility is not required.
-
-#### Scenario: Dashboard overview without request logs
-
-- **WHEN** the frontend fetches `GET /api/dashboard/overview`
-- **THEN** the response contains `accounts`, `summary`, and `windows` but does NOT contain `request_logs`
-
-#### Scenario: AccountSummary field reduction
-
-- **WHEN** the frontend fetches accounts (via dashboard overview or account list)
-- **THEN** the `AccountSummary` does NOT include `capacity_credits_primary`, `remaining_credits_primary`, `capacity_credits_secondary`, `remaining_credits_secondary`, `last_refresh_at`, or `deactivation_reason`
-
-#### Scenario: Request logs pagination metadata
-
-- **WHEN** the frontend fetches `GET /api/request-logs` with offset/limit
-- **THEN** the response includes `total` (total matching count) and `has_more` (boolean) alongside `requests`
-
-#### Scenario: Filter options with statuses
-
-- **WHEN** the frontend fetches `GET /api/request-logs/options`
-- **THEN** the response includes `statuses` (list of available status values) alongside `account_ids` and `model_options`
-
-### Requirement: Frontend test infrastructure
-
-The frontend project SHALL include a Vitest-based test infrastructure with React Testing Library and MSW v2 for API mocking. Tests SHALL be colocated with source files as `.test.ts(x)`. Shared test utilities (render wrapper, MSW server, data factories) SHALL reside in `src/test/`.
-
-#### Scenario: Test runner execution
-
-- **WHEN** the developer runs `npm test` in `frontend/`
-- **THEN** Vitest discovers and executes all `*.test.ts(x)` files using the Vite config (path aliases, plugins) without additional configuration
-
-#### Scenario: Component test with API data
-
-- **WHEN** a component test renders a component that fetches data via TanStack Query
-- **THEN** MSW intercepts the API call at the network level, the component renders with mock data, and assertions verify the rendered output
-
-#### Scenario: Zod schema contract test
-
-- **WHEN** a Zod schema test runs `safeParse` with a valid API response fixture
-- **THEN** the parse succeeds and the output matches the expected type; when run with an invalid fixture (missing field, wrong type), the parse fails with a descriptive error
-
-#### Scenario: Test isolation
-
-- **WHEN** multiple tests run in sequence
-- **THEN** each test has a fresh QueryClient (no cache leakage), MSW handlers are reset between tests, and no localStorage/DOM state persists
-
-### Requirement: Test coverage targets
-
-Zod schema tests SHALL achieve 95%+ line coverage. Utility function tests SHALL achieve 90%+ line coverage. Component tests SHALL achieve 70-80% line coverage. Vitest coverage thresholds SHALL be configured to fail CI below the minimum floor (70% overall).
-
-#### Scenario: Coverage gate
-
-- **WHEN** the developer runs `npm run test:coverage` in `frontend/`
-- **THEN** Vitest produces a coverage report and the build fails if overall line coverage drops below 70%
-
-### Requirement: Existing feature parity
-
-The React application MUST implement all features present in the current Alpine.js application. No existing functionality SHALL be removed or degraded during migration.
-
-#### Scenario: Feature checklist
-
-- **WHEN** the migration is complete
-- **THEN** every feature documented in the current frontend (dashboard metrics, donut charts, account cards, request log table with all filters, OAuth flow with browser and device methods, account import, account details with token info, settings toggles, password management, TOTP setup/verify/disable, API key CRUD with model/limit/expiry settings, theme toggle, status bar) is functional in the React application
-
-### Requirement: Old frontend removal
-
-After migration is complete, the old frontend files SHALL be removed: `app/static/index.html`, `app/static/index.js`, `app/static/index.css`, and all files in `app/static/components/`.
-
-#### Scenario: Clean removal
-
-- **WHEN** the React build outputs to `app/static/`
-- **THEN** no legacy Alpine.js files remain in the directory
-
-### Requirement: Firewall page in React dashboard
-The React dashboard MUST provide a Firewall page that displays current mode (`allow_all` or `allowlist_active`) and allows adding/removing IP addresses via `/api/firewall/ips`.
-
-#### Scenario: Firewall page loads list
-- **WHEN** user opens `/firewall`
-- **THEN** frontend requests `GET /api/firewall/ips` and renders mode + entries
-
-#### Scenario: User adds IP entry
-- **WHEN** user submits a valid IP in firewall form
-- **THEN** frontend calls `POST /api/firewall/ips` and refreshes rendered list
-
-#### Scenario: User removes IP entry
-- **WHEN** user confirms deletion for an existing firewall entry
-- **THEN** frontend calls `DELETE /api/firewall/ips/{ip}` and refreshes rendered list
-
-### Requirement: Accounts page renders mapped additional quota labels
-The Accounts page MUST render known additional quotas with their mapped user-facing label from canonical quota metadata instead of depending on raw upstream `limitName` strings.
-
-#### Scenario: Codex Spark quota uses mapped label after alias drift
-- **WHEN** an account summary contains an additional quota whose canonical key corresponds to `gpt-5.3-codex-spark`
-- **AND** the raw upstream `limitName` has changed from an earlier alias
-- **THEN** the Accounts page renders the quota label as `GPT-5.3-Codex-Spark`
-

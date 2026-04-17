@@ -5,6 +5,7 @@ from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.openai.contracts import OpenAIMessage
 from app.core.openai.message_coercion import coerce_messages
 from app.core.openai.requests import (
     ResponsesRequest,
@@ -21,7 +22,7 @@ _SUPPORTED_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "
 
 def _content_parts(content: JsonValue) -> list[JsonValue]:
     if is_json_list(content):
-        return cast(list[JsonValue], content)
+        return content
     return [content]
 
 
@@ -33,17 +34,17 @@ def _part_type(part: Mapping[str, JsonValue]) -> str | None:
     return "text" if isinstance(text_value, str) else None
 
 
-def _json_mapping(value: object) -> Mapping[str, JsonValue] | None:
+def _json_mapping(value: JsonValue | OpenAIMessage) -> Mapping[str, JsonValue] | None:
     if not is_json_mapping(value):
         return None
-    return cast(Mapping[str, JsonValue], value)
+    return value
 
 
 class ChatCompletionsRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = Field(min_length=1)
-    messages: list[dict[str, JsonValue]]
+    messages: list[OpenAIMessage]
     tools: list[JsonValue] = Field(default_factory=list)
     tool_choice: str | dict[str, JsonValue] | None = None
     parallel_tool_calls: bool | None = None
@@ -71,7 +72,7 @@ class ChatCompletionsRequest(BaseModel):
 
     @field_validator("messages")
     @classmethod
-    def _reject_file_id(cls, value: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
+    def _reject_file_id(cls, value: list[OpenAIMessage]) -> list[OpenAIMessage]:
         for message in value:
             message_mapping = _json_mapping(message)
             if message_mapping is None:
@@ -138,7 +139,7 @@ class ChatCompletionsRequest(BaseModel):
             include_obfuscation = stream_options.get("include_obfuscation")
             if include_obfuscation is not None:
                 data["stream_options"] = {"include_obfuscation": include_obfuscation}
-        instructions, input_items = coerce_messages("", messages)
+        instructions, input_items = coerce_messages("", cast(list[JsonValue], messages))
         data["instructions"] = instructions
         data["input"] = input_items
         data["tools"] = tools
@@ -265,11 +266,13 @@ def _text_format_from_parsed(parsed: ChatResponseFormat) -> ResponsesTextFormat:
         json_schema = parsed.json_schema
         if json_schema is None:
             raise ValueError("'response_format.json_schema' is required when type is 'json_schema'.")
-        return ResponsesTextFormat(
-            type=parsed.type,
-            schema_=json_schema.schema_,
-            name=json_schema.name,
-            strict=json_schema.strict,
+        return ResponsesTextFormat.model_validate(
+            {
+                "type": parsed.type,
+                "schema": json_schema.schema_,
+                "name": json_schema.name,
+                "strict": json_schema.strict,
+            }
         )
     if parsed.type in ("json_object", "text"):
         return ResponsesTextFormat(type=parsed.type)
@@ -372,8 +375,8 @@ def _validate_assistant_tool_calls(message: Mapping[str, JsonValue]) -> None:
             raise ValueError(f"assistant tool_calls[{index}].function must include a non-empty 'name'.")
 
 
-def _sanitize_user_messages(messages: list[dict[str, JsonValue]]) -> list[dict[str, JsonValue]]:
-    sanitized: list[dict[str, JsonValue]] = []
+def _sanitize_user_messages(messages: list[OpenAIMessage]) -> list[OpenAIMessage]:
+    sanitized: list[OpenAIMessage] = []
     for message in messages:
         role = message.get("role")
         if role != "user":
@@ -384,7 +387,7 @@ def _sanitize_user_messages(messages: list[dict[str, JsonValue]]) -> list[dict[s
         new_message = dict(message)
         if sanitized_content is not None:
             new_message["content"] = sanitized_content
-        sanitized.append(new_message)
+        sanitized.append(cast(OpenAIMessage, new_message))
     return sanitized
 
 

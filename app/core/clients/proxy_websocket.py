@@ -20,7 +20,8 @@ from websockets.typing import Origin
 
 from app.core.clients.proxy import ProxyResponseError, filter_inbound_headers
 from app.core.config.settings import get_settings
-from app.core.errors import OpenAIErrorEnvelope, openai_error
+from app.core.errors import OpenAIErrorDetail, OpenAIErrorEnvelope, openai_error
+from app.core.openai.models import OpenAIError
 from app.core.openai.parsing import parse_error_payload
 from app.core.utils.request_id import get_request_id
 
@@ -56,6 +57,8 @@ class UpstreamResponsesWebSocket(Protocol):
 
     async def close(self) -> None: ...
 
+    def response_header(self, name: str) -> str | None: ...
+
 
 class WebsocketsResponsesWebSocket:
     def __init__(self, connection: ClientConnection) -> None:
@@ -87,6 +90,16 @@ class WebsocketsResponsesWebSocket:
 
     async def close(self) -> None:
         await self._connection.close()
+
+    def response_header(self, name: str) -> str | None:
+        response = getattr(self._connection, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return None
+        value = headers.get(name)
+        if value is None:
+            return None
+        return str(value)
 
 
 def filter_inbound_websocket_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -147,7 +160,6 @@ async def connect_responses_websocket(
     account_id: str | None,
     *,
     base_url: str | None = None,
-    session: object | None = None,
 ) -> UpstreamResponsesWebSocket:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -155,8 +167,6 @@ async def connect_responses_websocket(
     upstream_headers = _build_upstream_websocket_headers(headers, access_token, account_id)
     origin = cast(Origin | None, _pop_header_case_insensitive(upstream_headers, "origin"))
     user_agent = _pop_header_case_insensitive(upstream_headers, "user-agent")
-    _ = session
-
     try:
         response = await websocket_connect(
             url,
@@ -250,4 +260,23 @@ def _try_parse_handshake_error_payload(
     error = parse_error_payload(payload)
     if error is None:
         return None
-    return {"error": error.model_dump(exclude_none=True)}
+    return {"error": _openai_error_detail(error)}
+
+
+def _openai_error_detail(error: OpenAIError) -> OpenAIErrorDetail:
+    detail: OpenAIErrorDetail = {}
+    if error.message is not None:
+        detail["message"] = error.message
+    if error.type is not None:
+        detail["type"] = error.type
+    if error.code is not None:
+        detail["code"] = error.code
+    if error.param is not None:
+        detail["param"] = error.param
+    if error.plan_type is not None:
+        detail["plan_type"] = error.plan_type
+    if error.resets_at is not None:
+        detail["resets_at"] = error.resets_at
+    if error.resets_in_seconds is not None:
+        detail["resets_in_seconds"] = error.resets_in_seconds
+    return detail

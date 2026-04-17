@@ -19,6 +19,8 @@ from app.core.auth import (
     parse_auth_json,
     token_expiry,
 )
+from app.core.auth.api_key_cache import get_api_key_cache
+from app.core.cache.invalidation import NAMESPACE_API_KEY, get_cache_invalidation_poller
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.utils.time import naive_utc_to_epoch, to_utc_naive, utcnow
@@ -36,6 +38,7 @@ from app.modules.accounts.schemas import (
     AccountSummary,
     AccountTrendsResponse,
 )
+from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageUpdater
@@ -194,6 +197,7 @@ class AccountsService:
         if self._usage_repo and self._usage_updater:
             latest_usage = await self._usage_repo.latest_by_account(window="primary")
             await self._usage_updater.refresh_accounts([saved], latest_usage)
+        get_account_selection_cache().invalidate()
         return AccountImportResponse(
             filename=filename,
             account_id=saved.id,
@@ -246,13 +250,26 @@ class AccountsService:
         return filename, archive_buffer.getvalue()
 
     async def reactivate_account(self, account_id: str) -> bool:
-        return await self._repo.update_status(account_id, AccountStatus.ACTIVE, None)
+        result = await self._repo.update_status(account_id, AccountStatus.ACTIVE, None, None, blocked_at=None)
+        if result:
+            get_account_selection_cache().invalidate()
+        return result
 
     async def pause_account(self, account_id: str) -> bool:
-        return await self._repo.update_status(account_id, AccountStatus.PAUSED, None)
+        result = await self._repo.update_status(account_id, AccountStatus.PAUSED, None, None, blocked_at=None)
+        if result:
+            get_account_selection_cache().invalidate()
+        return result
 
     async def delete_account(self, account_id: str) -> bool:
-        return await self._repo.delete(account_id)
+        result = await self._repo.delete(account_id)
+        if result:
+            get_account_selection_cache().invalidate()
+            get_api_key_cache().clear()
+            poller = get_cache_invalidation_poller()
+            if poller is not None:
+                await poller.bump(NAMESPACE_API_KEY)
+        return result
 
     async def _refresh_import_auth_if_needed(self, auth: AuthFile) -> tuple[AuthFile, bool]:
         expires_at = token_expiry(auth.tokens.access_token)

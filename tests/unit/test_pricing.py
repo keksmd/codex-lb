@@ -63,6 +63,33 @@ def test_get_pricing_for_model_gpt_5_4_alias():
     assert model == "gpt-5.4"
 
 
+def test_get_pricing_for_model_gpt_5_4_mini_alias():
+    result = get_pricing_for_model("gpt-5.4-mini-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+    assert result is not None
+    model, price = result
+    assert model == "gpt-5.4-mini"
+    assert price.input_per_1m == 0.75
+    assert price.cached_input_per_1m == 0.075
+    assert price.output_per_1m == 4.5
+
+
+def test_get_pricing_for_model_gpt_5_4_nano_alias():
+    result = get_pricing_for_model("gpt-5.4-nano-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+    assert result is not None
+    model, price = result
+    assert model == "gpt-5.4-nano"
+    assert price.input_per_1m == 0.20
+    assert price.cached_input_per_1m == 0.02
+    assert price.output_per_1m == 1.25
+
+
+def test_get_pricing_for_model_gpt_5_2_codex_alias():
+    result = get_pricing_for_model("gpt-5.2-codex-2026-03-17", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+    assert result is not None
+    model, _ = result
+    assert model == "gpt-5.2-codex"
+
+
 def test_get_pricing_for_model_gpt_5_2_chat_latest_alias():
     result = get_pricing_for_model("gpt-5.2-chat-latest", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
     assert result is not None
@@ -84,31 +111,46 @@ def test_calculate_cost_from_usage_cached_tokens():
 
 def test_calculate_cost_from_usage_priority_service_tier():
     usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
-    price = DEFAULT_PRICING_MODELS["gpt-5.1"]
+    price = DEFAULT_PRICING_MODELS["gpt-5.4"]
 
     cost = calculate_cost_from_usage(usage, price, service_tier="priority")
 
-    assert cost == pytest.approx(22.5)
+    assert cost == pytest.approx(35.0)
 
 
 def test_calculate_cost_from_usage_flex_service_tier():
     usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
-    price = DEFAULT_PRICING_MODELS["gpt-5.1"]
+    price = DEFAULT_PRICING_MODELS["gpt-5.4-mini"]
 
     cost = calculate_cost_from_usage(usage, price, service_tier="flex")
 
-    assert cost == pytest.approx(5.625)
+    assert cost == pytest.approx(2.625)
 
 
 def test_calculate_cost_from_usage_service_tier_trims_whitespace():
     usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
-    price = DEFAULT_PRICING_MODELS["gpt-5.1"]
+    priority_price = DEFAULT_PRICING_MODELS["gpt-5.4"]
+    flex_price = DEFAULT_PRICING_MODELS["gpt-5.4-mini"]
 
-    priority_cost = calculate_cost_from_usage(usage, price, service_tier=" priority ")
-    flex_cost = calculate_cost_from_usage(usage, price, service_tier=" flex ")
+    priority_cost = calculate_cost_from_usage(usage, priority_price, service_tier=" priority ")
+    flex_cost = calculate_cost_from_usage(usage, flex_price, service_tier=" flex ")
 
-    assert priority_cost == pytest.approx(22.5)
-    assert flex_cost == pytest.approx(5.625)
+    assert priority_cost == pytest.approx(35.0)
+    assert flex_cost == pytest.approx(2.625)
+
+
+def test_calculate_cost_from_usage_legacy_gpt_5_service_tiers() -> None:
+    usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
+
+    gpt_5_priority = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5"], service_tier="priority")
+    gpt_5_1_flex = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.1"], service_tier="flex")
+    gpt_5_2_priority = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.2"], service_tier="priority")
+    gpt_5_2_flex = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS["gpt-5.2"], service_tier="flex")
+
+    assert gpt_5_priority == pytest.approx(22.5)
+    assert gpt_5_1_flex == pytest.approx(5.625)
+    assert gpt_5_2_priority == pytest.approx(31.5)
+    assert gpt_5_2_flex == pytest.approx(7.875)
 
 
 def test_calculate_cost_from_usage_unsupported_tiers_fall_back_to_standard():
@@ -128,6 +170,15 @@ def test_calculate_cost_from_usage_unsupported_tiers_fall_back_to_standard():
     assert gpt_5_3_chat_priority == pytest.approx(15.75)
     assert gpt_5_2_chat_priority == pytest.approx(15.75)
     assert gpt_5_2_chat_flex == pytest.approx(15.75)
+
+
+def test_calculate_cost_from_usage_gpt_5_2_codex_priority():
+    usage = UsageTokens(input_tokens=1_000_000.0, output_tokens=1_000_000.0)
+    price = DEFAULT_PRICING_MODELS["gpt-5.2-codex"]
+
+    cost = calculate_cost_from_usage(usage, price, service_tier="priority")
+
+    assert cost == pytest.approx(31.5)
 
 
 def test_calculate_cost_from_usage_gpt_5_4_pro_flex():
@@ -164,6 +215,34 @@ def test_calculate_cost_from_usage_gpt_5_4_long_context_flex():
     cost = calculate_cost_from_usage(usage, price, service_tier="flex")
 
     expected = (250_000 / 1_000_000) * 2.5 + (50_000 / 1_000_000) * 0.25 + (100_000 / 1_000_000) * 11.25
+    assert cost == pytest.approx(expected)
+
+
+def test_calculate_cost_from_usage_gpt_5_4_mini():
+    usage = UsageTokens(
+        input_tokens=1_000_000.0,
+        output_tokens=1_000_000.0,
+        cached_input_tokens=100_000.0,
+    )
+    price = DEFAULT_PRICING_MODELS["gpt-5.4-mini"]
+
+    cost = calculate_cost_from_usage(usage, price)
+
+    expected = (900_000 / 1_000_000) * 0.75 + (100_000 / 1_000_000) * 0.075 + (1_000_000 / 1_000_000) * 4.5
+    assert cost == pytest.approx(expected)
+
+
+def test_calculate_cost_from_usage_gpt_5_4_nano():
+    usage = UsageTokens(
+        input_tokens=1_000_000.0,
+        output_tokens=1_000_000.0,
+        cached_input_tokens=100_000.0,
+    )
+    price = DEFAULT_PRICING_MODELS["gpt-5.4-nano"]
+
+    cost = calculate_cost_from_usage(usage, price)
+
+    expected = (900_000 / 1_000_000) * 0.20 + (100_000 / 1_000_000) * 0.02 + (1_000_000 / 1_000_000) * 1.25
     assert cost == pytest.approx(expected)
 
 

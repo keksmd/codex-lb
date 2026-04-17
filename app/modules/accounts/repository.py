@@ -8,11 +8,11 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.usage.pricing import UsageTokens, calculate_cost_from_usage, get_pricing_for_model
 from app.db.models import Account, AccountStatus, DashboardSettings, RequestLog, StickySession, UsageHistory
 
 _SETTINGS_ROW_ID = 1
 _DUPLICATE_ACCOUNT_SUFFIX = "__copy"
+_UNSET = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,29 +47,27 @@ class AccountsRepository:
         self,
         account_ids: list[str] | None = None,
     ) -> dict[str, AccountRequestUsageSummary]:
+        summaries: dict[str, AccountRequestUsageSummary] = {}
         output_tokens_expr = func.coalesce(RequestLog.output_tokens, RequestLog.reasoning_tokens, 0)
         stmt = select(
             RequestLog.account_id,
-            RequestLog.model,
-            RequestLog.service_tier,
             func.count(RequestLog.id).label("request_count"),
             func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
             func.coalesce(func.sum(output_tokens_expr), 0).label("output_tokens"),
             func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
-        ).group_by(RequestLog.account_id, RequestLog.model, RequestLog.service_tier)
+            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("total_cost_usd"),
+        ).group_by(RequestLog.account_id)
         if account_ids:
             stmt = stmt.where(RequestLog.account_id.in_(account_ids))
 
         result = await self._session.execute(stmt)
-        rollup: dict[str, dict[str, float | int]] = {}
         for (
             account_id,
-            model,
-            service_tier,
             request_count,
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            total_cost_usd,
         ) in result.all():
             if not account_id:
                 continue
@@ -77,46 +75,15 @@ class AccountsRepository:
             output_sum = int(output_tokens or 0)
             cached_sum = int(cached_input_tokens or 0)
             cached_sum = max(0, min(cached_sum, input_sum))
-            tokens_sum = input_sum + output_sum
-
-            entry = rollup.setdefault(
-                account_id,
-                {
-                    "request_count": 0,
-                    "total_tokens": 0,
-                    "cached_input_tokens": 0,
-                    "total_cost_usd": 0.0,
-                },
+            return_row = AccountRequestUsageSummary(
+                request_count=int(request_count or 0),
+                total_tokens=input_sum + output_sum,
+                cached_input_tokens=cached_sum,
+                total_cost_usd=round(float(total_cost_usd or 0.0), 6),
             )
-            entry["request_count"] += int(request_count or 0)
-            entry["total_tokens"] += tokens_sum
-            entry["cached_input_tokens"] += cached_sum
+            summaries[account_id] = return_row
 
-            resolved = get_pricing_for_model(model or "", None, None)
-            if resolved is None:
-                continue
-            _, price = resolved
-            cost_usd = calculate_cost_from_usage(
-                UsageTokens(
-                    input_tokens=float(input_sum),
-                    output_tokens=float(output_sum),
-                    cached_input_tokens=float(cached_sum),
-                ),
-                price,
-                service_tier=service_tier,
-            )
-            if cost_usd is not None:
-                entry["total_cost_usd"] += cost_usd
-
-        return {
-            account_id: AccountRequestUsageSummary(
-                request_count=int(values["request_count"]),
-                total_tokens=int(values["total_tokens"]),
-                cached_input_tokens=int(values["cached_input_tokens"]),
-                total_cost_usd=round(float(values["total_cost_usd"]), 6),
-            )
-            for account_id, values in rollup.items()
-        }
+        return summaries
 
     async def exists_active_chatgpt_account_id(self, chatgpt_account_id: str) -> bool:
         result = await self._session.execute(
@@ -175,13 +142,62 @@ class AccountsRepository:
         status: AccountStatus,
         deactivation_reason: str | None = None,
         reset_at: int | None = None,
+        blocked_at: int | None | object = _UNSET,
     ) -> bool:
+        values: dict[str, object | None] = {
+            "status": status,
+            "deactivation_reason": deactivation_reason,
+            "reset_at": reset_at,
+        }
+        if blocked_at is not _UNSET:
+            values["blocked_at"] = blocked_at
         result = await self._session.execute(
+            update(Account).where(Account.id == account_id).values(**values).returning(Account.id)
+        )
+        await self._session.commit()
+        return result.scalar_one_or_none() is not None
+
+    async def update_status_if_current(
+        self,
+        account_id: str,
+        status: AccountStatus,
+        deactivation_reason: str | None = None,
+        reset_at: int | None = None,
+        blocked_at: int | None | object = _UNSET,
+        *,
+        expected_status: AccountStatus,
+        expected_deactivation_reason: str | None = None,
+        expected_reset_at: int | None = None,
+        expected_blocked_at: int | None | object = _UNSET,
+    ) -> bool:
+        values: dict[str, object | None] = {
+            "status": status,
+            "deactivation_reason": deactivation_reason,
+            "reset_at": reset_at,
+        }
+        if blocked_at is not _UNSET:
+            values["blocked_at"] = blocked_at
+        stmt = (
             update(Account)
             .where(Account.id == account_id)
-            .values(status=status, deactivation_reason=deactivation_reason, reset_at=reset_at)
+            .where(Account.status == expected_status)
+            .values(**values)
             .returning(Account.id)
         )
+        if expected_deactivation_reason is None:
+            stmt = stmt.where(Account.deactivation_reason.is_(None))
+        else:
+            stmt = stmt.where(Account.deactivation_reason == expected_deactivation_reason)
+        if expected_reset_at is None:
+            stmt = stmt.where(Account.reset_at.is_(None))
+        else:
+            stmt = stmt.where(Account.reset_at == expected_reset_at)
+        if expected_blocked_at is not _UNSET:
+            if expected_blocked_at is None:
+                stmt = stmt.where(Account.blocked_at.is_(None))
+            else:
+                stmt = stmt.where(Account.blocked_at == expected_blocked_at)
+        result = await self._session.execute(stmt)
         await self._session.commit()
         return result.scalar_one_or_none() is not None
 
@@ -204,7 +220,7 @@ class AccountsRepository:
         email: str | None = None,
         chatgpt_account_id: str | None = None,
     ) -> bool:
-        values = {
+        values: dict[str, bytes | datetime | str] = {
             "access_token_encrypted": access_token_encrypted,
             "refresh_token_encrypted": refresh_token_encrypted,
             "id_token_encrypted": id_token_encrypted,
@@ -286,6 +302,8 @@ def _apply_account_updates(target: Account, source: Account) -> None:
     target.last_refresh = source.last_refresh
     target.status = source.status
     target.deactivation_reason = source.deactivation_reason
+    target.reset_at = source.reset_at
+    target.blocked_at = source.blocked_at
 
 
 def _advisory_lock_key(scope: str, value: str) -> int:

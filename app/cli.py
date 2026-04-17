@@ -27,6 +27,7 @@ def main() -> None:
     if bool(args.ssl_certfile) ^ bool(args.ssl_keyfile):
         raise SystemExit("Both --ssl-certfile and --ssl-keyfile must be provided together.")
 
+    os.environ["PORT"] = str(args.port)
     log_level = configure_logging()
     logger.info(
         "Starting codex-lb host=%s port=%s ssl=%s log_level=%s access_log=%s",

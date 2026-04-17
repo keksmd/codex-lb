@@ -6,6 +6,7 @@ import socket
 
 from fastapi import APIRouter, Body, Depends, Request
 
+from app.core.audit.service import AuditService
 from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
 from app.core.config.settings_cache import get_settings_cache
 from app.core.exceptions import DashboardBadRequestError
@@ -80,6 +81,9 @@ async def get_settings(
         prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
         routing_strategy=settings.routing_strategy,
         openai_cache_affinity_max_age_seconds=settings.openai_cache_affinity_max_age_seconds,
+        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=settings.http_responses_session_bridge_prompt_cache_idle_ttl_seconds,
+        http_responses_session_bridge_gateway_safe_mode=settings.http_responses_session_bridge_gateway_safe_mode,
+        sticky_reallocation_budget_threshold_pct=settings.sticky_reallocation_budget_threshold_pct,
         import_without_overwrite=settings.import_without_overwrite,
         http_proxy_url=settings.http_proxy_url,
         totp_required_on_login=settings.totp_required_on_login,
@@ -95,6 +99,7 @@ async def get_runtime_connect_address(request: Request) -> RuntimeConnectAddress
 
 @router.put("", response_model=DashboardSettingsResponse)
 async def update_settings(
+    request: Request,
     payload: DashboardSettingsUpdateRequest = Body(...),
     context: SettingsContext = Depends(get_settings_context),
 ) -> DashboardSettingsResponse:
@@ -110,6 +115,21 @@ async def update_settings(
                     payload.openai_cache_affinity_max_age_seconds
                     if payload.openai_cache_affinity_max_age_seconds is not None
                     else current.openai_cache_affinity_max_age_seconds
+                ),
+                http_responses_session_bridge_prompt_cache_idle_ttl_seconds=(
+                    payload.http_responses_session_bridge_prompt_cache_idle_ttl_seconds
+                    if payload.http_responses_session_bridge_prompt_cache_idle_ttl_seconds is not None
+                    else current.http_responses_session_bridge_prompt_cache_idle_ttl_seconds
+                ),
+                http_responses_session_bridge_gateway_safe_mode=(
+                    payload.http_responses_session_bridge_gateway_safe_mode
+                    if payload.http_responses_session_bridge_gateway_safe_mode is not None
+                    else current.http_responses_session_bridge_gateway_safe_mode
+                ),
+                sticky_reallocation_budget_threshold_pct=(
+                    payload.sticky_reallocation_budget_threshold_pct
+                    if payload.sticky_reallocation_budget_threshold_pct is not None
+                    else current.sticky_reallocation_budget_threshold_pct
                 ),
                 import_without_overwrite=(
                     payload.import_without_overwrite
@@ -133,12 +153,35 @@ async def update_settings(
         raise DashboardBadRequestError(str(exc), code="invalid_totp_config") from exc
 
     await get_settings_cache().invalidate()
+    changed_fields = [
+        field_name
+        for field_name in (
+            "sticky_threads_enabled",
+            "upstream_stream_transport",
+            "prefer_earlier_reset_accounts",
+            "routing_strategy",
+            "openai_cache_affinity_max_age_seconds",
+            "http_responses_session_bridge_gateway_safe_mode",
+            "import_without_overwrite",
+            "totp_required_on_login",
+            "api_key_auth_enabled",
+        )
+        if getattr(current, field_name) != getattr(updated, field_name)
+    ]
+    AuditService.log_async(
+        "settings_changed",
+        actor_ip=request.client.host if request.client else None,
+        details={"changed_fields": changed_fields},
+    )
     return DashboardSettingsResponse(
         sticky_threads_enabled=updated.sticky_threads_enabled,
         upstream_stream_transport=updated.upstream_stream_transport,
         prefer_earlier_reset_accounts=updated.prefer_earlier_reset_accounts,
         routing_strategy=updated.routing_strategy,
         openai_cache_affinity_max_age_seconds=updated.openai_cache_affinity_max_age_seconds,
+        http_responses_session_bridge_prompt_cache_idle_ttl_seconds=updated.http_responses_session_bridge_prompt_cache_idle_ttl_seconds,
+        http_responses_session_bridge_gateway_safe_mode=updated.http_responses_session_bridge_gateway_safe_mode,
+        sticky_reallocation_budget_threshold_pct=updated.sticky_reallocation_budget_threshold_pct,
         import_without_overwrite=updated.import_without_overwrite,
         http_proxy_url=updated.http_proxy_url,
         totp_required_on_login=updated.totp_required_on_login,

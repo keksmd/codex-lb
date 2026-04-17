@@ -163,3 +163,18 @@
 - [x] Confirm `/v1/messages/count_tokens` returns a stable approximate token count for Claude-side preflight/token estimation.
 - [x] Confirm when API key auth is enabled, Anthropic clients can authenticate with `x-api-key`.
 - [x] Confirm a real Claude CLI run can target local `codex-lb` through `~/.claude/settings.json` and complete a prompt via `POST /v1/messages`.
+
+## Merge Conflict Resolution: origin/main + dada development
+- [x] Inspect the active merge, remotes, and per-file history to map DADA feature changes against `origin/main`.
+- [x] Resolve all unmerged files without dropping either the Anthropic adapter work or upstream mainline features.
+- [x] Stage the resolved files and confirm no merge markers remain.
+- [x] Verify backend/frontend state with build + targeted tests for the touched conflict areas.
+
+## Review (Merge Conflict Resolution: origin/main + dada development)
+- [x] Confirm the merged tree retains both `origin/main` runtime/auth/settings changes and DADA-specific Anthropic/accounts/frontend additions.
+- [x] Confirm git reports zero unmerged paths.
+- [x] Confirm verification covers both Python backend and frontend/mock/test surfaces affected by the conflicts.
+- [x] Evidence: `.venv/bin/pytest tests/unit/test_auth_manager.py tests/unit/test_settings_firewall.py tests/unit/test_usage_client.py tests/integration/test_settings_api.py tests/integration/test_accounts_api_extended.py tests/integration/test_migrations.py -q` -> `60 passed, 3 skipped`.
+- [x] Evidence: `.venv/bin/pytest -q` -> `1716 passed, 7 skipped`.
+- [x] Evidence: `openspec validate --specs` -> `19 passed, 0 failed`.
+- [x] Evidence: IntelliJ `build_project` on `app/modules/accounts/api.py`, `tests/integration/test_migrations.py`, and `app/db/alembic/versions/20260413_010000_merge_blocked_at_and_dashboard_enum_heads.py` succeeded without problems.

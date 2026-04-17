@@ -5,14 +5,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.core import usage as usage_core
-from app.core.usage.logs import (
-    cached_input_tokens_from_log,
-    total_tokens_from_log,
-    usage_tokens_from_log,
-)
-from app.core.usage.pricing import CostItem, UsageTokens, calculate_costs
+from app.core.usage.logs import cached_input_tokens_from_log, cost_from_log, total_tokens_from_log
 from app.core.usage.types import (
     BucketModelAggregate,
+    RequestActivityAggregate,
+    UsageCostByModel,
     UsageCostSummary,
     UsageMetricsSummary,
     UsageSummaryPayload,
@@ -37,32 +34,69 @@ _BUCKET_COUNT = 28
 _BUCKET_SECONDS = 21600  # 6 hours
 
 
+@dataclass(frozen=True)
+class ActivityCostSummary:
+    currency: str
+    total_usd: float
+    by_model: list[UsageCostByModel]
+
+
+@dataclass(frozen=True)
+class ActivityMetricsSummary:
+    requests: int | None
+    tokens: int | None
+    cached_input_tokens: int | None = None
+    error_rate: float | None = None
+    error_count: int | None = None
+    top_error: str | None = None
+
+
+def align_bucket_window_start(
+    since: datetime,
+    bucket_seconds: int,
+) -> datetime:
+    since_epoch = (
+        int(since.replace(tzinfo=timezone.utc).timestamp()) if since.tzinfo is None else int(since.timestamp())
+    )
+    remainder = since_epoch % bucket_seconds
+    first_bucket_epoch = since_epoch if remainder == 0 else since_epoch - remainder + bucket_seconds
+    aligned = datetime.fromtimestamp(first_bucket_epoch, tz=timezone.utc)
+    if since.tzinfo is None:
+        return aligned.replace(tzinfo=None)
+    return aligned
+
+
 def build_trends_from_buckets(
     rows: list[BucketModelAggregate],
     since: datetime,
     bucket_seconds: int = _BUCKET_SECONDS,
     bucket_count: int = _BUCKET_COUNT,
-) -> tuple[MetricsTrends, UsageMetricsSummary, UsageCostSummary]:
-    since_epoch = (
-        int(since.replace(tzinfo=timezone.utc).timestamp()) if since.tzinfo is None else int(since.timestamp())
-    )
+    top_error: str | None = None,
+) -> tuple[MetricsTrends, ActivityMetricsSummary, ActivityCostSummary]:
     # Align slots so the last slot contains "now" (since + window).
     # Use floor to snap since to a bucket boundary, then shift by 1
     # so that recent data falls within the slot range.
-    first_bucket = (since_epoch // bucket_seconds) * bucket_seconds + bucket_seconds
-    slots = [first_bucket + i * bucket_seconds for i in range(bucket_count)]
+    first_bucket = align_bucket_window_start(since, bucket_seconds)
+    first_bucket_epoch = (
+        int(first_bucket.replace(tzinfo=timezone.utc).timestamp())
+        if first_bucket.tzinfo is None
+        else int(first_bucket.timestamp())
+    )
+    slots = [first_bucket_epoch + i * bucket_seconds for i in range(bucket_count)]
     slot_set = set(slots)
 
     # Accumulate per-bucket values
     bucket_requests: dict[int, int] = defaultdict(int)
     bucket_errors: dict[int, int] = defaultdict(int)
     bucket_tokens: dict[int, int] = defaultdict(int)
-    bucket_cost_items: dict[int, list[CostItem]] = defaultdict(list)
+    bucket_costs: dict[int, float] = defaultdict(float)
+    total_costs_by_model: dict[str, float] = defaultdict(float)
 
     total_requests = 0
     total_errors = 0
     total_tokens = 0
     total_cached_tokens = 0
+    total_cost_usd = 0.0
 
     for row in rows:
         epoch = row.bucket_epoch
@@ -71,22 +105,14 @@ def build_trends_from_buckets(
         bucket_requests[epoch] += row.request_count
         bucket_errors[epoch] += row.error_count
         bucket_tokens[epoch] += row.input_tokens + row.output_tokens
-        bucket_cost_items[epoch].append(
-            CostItem(
-                model=row.model,
-                service_tier=row.service_tier,
-                usage=UsageTokens(
-                    input_tokens=float(row.input_tokens),
-                    output_tokens=float(row.output_tokens),
-                    cached_input_tokens=float(row.cached_input_tokens),
-                ),
-            )
-        )
+        bucket_costs[epoch] += float(row.cost_usd)
+        total_costs_by_model[row.model] += float(row.cost_usd)
 
         total_requests += row.request_count
         total_errors += row.error_count
         total_tokens += row.input_tokens + row.output_tokens
         total_cached_tokens += row.cached_input_tokens
+        total_cost_usd += float(row.cost_usd)
 
     requests_points: list[TrendPoint] = []
     tokens_points: list[TrendPoint] = []
@@ -98,11 +124,7 @@ def build_trends_from_buckets(
         req = bucket_requests.get(epoch, 0)
         err = bucket_errors.get(epoch, 0)
         tok = bucket_tokens.get(epoch, 0)
-
-        cost_value = 0.0
-        if epoch in bucket_cost_items:
-            cost_summary = calculate_costs(bucket_cost_items[epoch])
-            cost_value = cost_summary.total_usd_7d
+        cost_value = bucket_costs.get(epoch, 0.0)
 
         err_rate = (err / req) if req > 0 else 0.0
 
@@ -122,31 +144,52 @@ def build_trends_from_buckets(
     if total_requests > 0:
         error_rate_total = total_errors / total_requests
 
-    metrics = UsageMetricsSummary(
-        requests_7d=total_requests,
-        tokens_secondary_window=total_tokens,
-        cached_tokens_secondary_window=total_cached_tokens,
-        error_rate_7d=error_rate_total,
-        top_error=None,
+    metrics = ActivityMetricsSummary(
+        requests=total_requests,
+        tokens=total_tokens,
+        cached_input_tokens=total_cached_tokens,
+        error_rate=error_rate_total,
+        error_count=total_errors,
+        top_error=top_error,
     )
 
-    # Compute total cost from all rows
-    all_cost_items = [
-        CostItem(
-            model=row.model,
-            service_tier=row.service_tier,
-            usage=UsageTokens(
-                input_tokens=float(row.input_tokens),
-                output_tokens=float(row.output_tokens),
-                cached_input_tokens=float(row.cached_input_tokens),
-            ),
-        )
-        for row in rows
-        if row.bucket_epoch in slot_set
-    ]
-    total_cost = calculate_costs(all_cost_items)
+    total_cost = ActivityCostSummary(
+        currency="USD",
+        total_usd=round(total_cost_usd, 6),
+        by_model=[
+            UsageCostByModel(model=model, usd=round(cost, 6)) for model, cost in sorted(total_costs_by_model.items())
+        ],
+    )
 
     return trends, metrics, total_cost
+
+
+def build_activity_summaries(
+    aggregate: RequestActivityAggregate,
+    *,
+    top_error: str | None = None,
+) -> tuple[ActivityMetricsSummary, ActivityCostSummary]:
+    total_requests = aggregate.request_count
+    total_tokens = aggregate.input_tokens + aggregate.output_tokens
+    error_rate: float | None = None
+    if total_requests > 0:
+        error_rate = aggregate.error_count / total_requests
+
+    return (
+        ActivityMetricsSummary(
+            requests=total_requests,
+            tokens=total_tokens,
+            cached_input_tokens=aggregate.cached_input_tokens,
+            error_rate=error_rate,
+            error_count=aggregate.error_count,
+            top_error=top_error,
+        ),
+        ActivityCostSummary(
+            currency="USD",
+            total_usd=round(aggregate.cost_usd, 6),
+            by_model=[],
+        ),
+    )
 
 
 def build_usage_summary_response(
@@ -165,8 +208,7 @@ def build_usage_summary_response(
     if cost_override is not None:
         cost = cost_override
     else:
-        cost_items = [item for item in (_log_to_cost_item(log) for log in logs_secondary) if item]
-        cost = calculate_costs(cost_items)
+        cost = _cost_summary_from_logs(logs_secondary)
 
     metrics = metrics_override if metrics_override is not None else _usage_metrics(logs_secondary)
 
@@ -244,12 +286,20 @@ def _build_account_history(
     return results
 
 
-def _log_to_cost_item(log: RequestLog) -> CostItem | None:
-    model = log.model
-    usage = usage_tokens_from_log(log)
-    if not model or not usage:
-        return None
-    return CostItem(model=model, usage=usage, service_tier=log.service_tier)
+def _cost_summary_from_logs(logs: list[RequestLog]) -> UsageCostSummary:
+    total = 0.0
+    by_model: dict[str, float] = defaultdict(float)
+    for log in logs:
+        cost = cost_from_log(log)
+        if cost is None:
+            continue
+        total += cost
+        by_model[log.model] += cost
+    return UsageCostSummary(
+        currency="USD",
+        total_usd_7d=round(total, 6),
+        by_model=[UsageCostByModel(model=model, usd=round(cost, 6)) for model, cost in sorted(by_model.items())],
+    )
 
 
 def _usage_metrics(logs_secondary: list[RequestLog]) -> UsageMetricsSummary:
@@ -298,14 +348,16 @@ def _top_error_code(logs: list[RequestLog]) -> str | None:
 
 def _summary_payload_to_response(payload: UsageSummaryPayload) -> UsageSummaryResponse:
     return UsageSummaryResponse(
-        primary_window=_window_snapshot_to_model(payload.primary_window),
-        secondary_window=_window_snapshot_to_model(payload.secondary_window) if payload.secondary_window else None,
+        primary_window=build_usage_window_summary_model(payload.primary_window),
+        secondary_window=(
+            build_usage_window_summary_model(payload.secondary_window) if payload.secondary_window else None
+        ),
         cost=_cost_summary_to_model(payload.cost),
         metrics=_metrics_summary_to_model(payload.metrics) if payload.metrics else None,
     )
 
 
-def _window_snapshot_to_model(snapshot: UsageWindowSnapshot) -> UsageWindow:
+def build_usage_window_summary_model(snapshot: UsageWindowSnapshot) -> UsageWindow:
     capacity_credits = float(snapshot.capacity_credits)
     remaining_credits = usage_core.remaining_credits_from_used(snapshot.used_credits, capacity_credits) or 0.0
     remaining_percent = max(0.0, 100.0 - float(snapshot.used_percent)) if capacity_credits > 0 else 0.0
